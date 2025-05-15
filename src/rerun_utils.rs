@@ -1,8 +1,6 @@
 use bytemuck::cast_slice;
 use rerun::{
-    archetypes::DepthImage,
-    datatypes::ChannelDatatype,   // <- new
-    RecordingStream,
+    archetypes::DepthImage, datatypes::ChannelDatatype, EncodedImage, RecordingStream
 };
 
 use crate::DepthFrameSerializable;
@@ -22,5 +20,12 @@ pub fn log_depth(rec: &RecordingStream, frame: &DepthFrameSerializable) -> anyho
 
     // 3. send it:
     rec.log("/camera/depth", &depth)?;
+    Ok(())
+}
+
+pub fn log_rgb_jpeg(rec: &RecordingStream, jpeg: &[u8]) -> anyhow::Result<()> {
+    let img = EncodedImage::from_file_contents(jpeg.to_vec())  // alloc once
+        .with_media_type("image/jpeg");                       // explicit is faster
+    rec.log("/camera/rgb", &img)?;
     Ok(())
 }

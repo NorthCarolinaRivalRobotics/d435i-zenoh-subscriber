@@ -1,4 +1,4 @@
-use rerun_utils::log_depth;
+use rerun_utils::{log_depth, log_rgb_jpeg};
 use types::{ColorFrameSerializable, DepthFrameSerializable};
 use std::time::{Duration, Instant};
 use snap::raw::Decoder;
@@ -53,10 +53,13 @@ async fn main() {
                     println!("Color wait time (approx): {:?}", recv_color_elapsed);
 
                     let decode_start = Instant::now();
-                    let color_frame = ColorFrameSerializable::decodeAndDecompress(sample.payload().to_bytes().to_vec());
+                    let (color_frame, timestamp) = ColorFrameSerializable::decodeAndDecompress(sample.payload().to_bytes().to_vec());
                     let decode_duration = decode_start.elapsed();
                     println!("Color decode time: {:?}", decode_duration);
-                    println!("Received (color): {:?}", color_frame.data.len());
+                    println!("Received (color): {:?}", color_frame.len());
+                    println!("Timestamp: {:?}", timestamp);
+                    log_rgb_jpeg(&rec, &color_frame).unwrap();
+
                 } else {
                     break;
                 }
@@ -64,3 +67,4 @@ async fn main() {
         }
     }
 }
+
