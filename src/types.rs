@@ -25,8 +25,27 @@ pub struct RGB8Local {
     r: u8,
 }
 
+const DEPTH_SCALE_FACTOR: u16 = 8738; // multiply by this to convert meters to u16
+const MINIMUM_DISTANCE_METERS: f32 = 0.5;
+
+pub fn encode_meters_to_u16(meters: f32)     -> u16 {
+    ((meters - MINIMUM_DISTANCE_METERS) * DEPTH_SCALE_FACTOR as f32) as u16
+}
+
+pub fn decode_u16_to_meters(code: u16) -> f32 {
+    (code as f32) / DEPTH_SCALE_FACTOR as f32 + MINIMUM_DISTANCE_METERS
+}
+
+
 #[derive(Serialize, Deserialize, Debug, Clone, Encode, Decode)]
 pub struct DepthFrameSerializable {
+    pub width: usize,
+    pub height: usize,
+    pub timestamp: f64,
+    pub data: Vec<u16>, // distances in meters
+}
+
+pub struct DepthFrameRealUnits {
     pub width: usize,
     pub height: usize,
     pub timestamp: f64,
@@ -58,11 +77,17 @@ impl DepthFrameSerializable {
         compressed_encoded
     }
 
-    pub fn decodeAndDecompress(encoded: Vec<u8>) -> Self {
+    pub fn decodeAndDecompress(encoded: Vec<u8>) -> DepthFrameRealUnits {
         let mut decoder = Decoder::new();
         let decompressed_data = decoder.decompress_vec(encoded.as_ref()).unwrap();
         let decoded: (Self, usize) = bincode::decode_from_slice(decompressed_data.as_ref(), bincode::config::standard()).unwrap();   
-        decoded.0
+        let mut real_units = DepthFrameRealUnits {
+            width: decoded.0.width,
+            height: decoded.0.height,
+            timestamp: decoded.0.timestamp,
+            data: decoded.0.data.iter().map(|&code| decode_u16_to_meters(code)).collect(),
+        };
+        real_units
     }
 }
 

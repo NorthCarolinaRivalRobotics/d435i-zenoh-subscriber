@@ -3,10 +3,10 @@ use rerun::{
     archetypes::DepthImage, datatypes::ChannelDatatype, EncodedImage, RecordingStream
 };
 
-use crate::DepthFrameSerializable;
+use crate::types::DepthFrameRealUnits;
 
 /// Log a floating-point depth frame (metres) to Rerun.
-pub fn log_depth(rec: &RecordingStream, frame: &DepthFrameSerializable) -> anyhow::Result<()> {
+pub fn log_depth(rec: &RecordingStream, frame: &DepthFrameRealUnits) -> anyhow::Result<()> {
     // 1. reinterpret the f32 slice as raw bytes – zero-copy:
     let raw: &[u8] = cast_slice::<f32, u8>(&frame.data);
 
