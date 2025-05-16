@@ -5,6 +5,8 @@ use snap::raw::Decoder;
 use snap::raw::Encoder;
 use turbojpeg::decompress_image;
 use turbojpeg::image::Rgb;
+use zstd::stream::copy_decode;
+use zstd::stream::copy_encode;
 use zstd::zstd_safe::compress;
 use zstd::zstd_safe::decompress;
 use turbojpeg::Subsamp;
@@ -71,16 +73,19 @@ pub struct ColorFrameSerializable {
 impl DepthFrameSerializable {
     pub fn encodeAndCompress(&self) -> Vec<u8> {
         let encoded = bincode::encode_to_vec(&self, bincode::config::standard()).unwrap();
-        // use snap here
-        let mut encoder = Encoder::new();
-        let compressed_encoded = encoder.compress_vec(&encoded).unwrap();
-        compressed_encoded
+        let mut result = Vec::new();
+        copy_encode(&encoded[..], &mut result, 6).unwrap();
+        result
     }
 
     pub fn decodeAndDecompress(encoded: Vec<u8>) -> DepthFrameRealUnits {
-        let mut decoder = Decoder::new();
-        let decompressed_data = decoder.decompress_vec(encoded.as_ref()).unwrap();
+
+        let mut decompressed_data = Vec::new();
+        copy_decode(&encoded[..], &mut decompressed_data).unwrap();
+
+
         let decoded: (Self, usize) = bincode::decode_from_slice(decompressed_data.as_ref(), bincode::config::standard()).unwrap();   
+        
         let mut real_units = DepthFrameRealUnits {
             width: decoded.0.width,
             height: decoded.0.height,
