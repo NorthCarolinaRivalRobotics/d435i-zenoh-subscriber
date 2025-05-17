@@ -8,6 +8,7 @@ anyhow = "1.0.98"
 bincode = "2.0.1"
 bytemuck = "1.23.0"
 features = "0.10.0"
+nalgebra = { version = "0.33.2", features = ["std"] }
 ndarray = "0.16.1"
 rerun = "0.23.2"
 serde = { version = "1.0.219", features = ["derive"] }

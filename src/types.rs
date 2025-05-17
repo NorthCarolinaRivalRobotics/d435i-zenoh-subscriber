@@ -124,3 +124,23 @@ impl ColorFrameSerializable {
     
 }
 
+
+
+
+use nalgebra::{Matrix3, Vector3};
+
+#[derive(Clone, Copy)]
+pub struct Intrinsics {
+    pub width: usize,
+    pub height: usize,
+    pub fx: f32,
+    pub fy: f32,
+    pub ppx: f32,
+    pub ppy: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct Extrinsics {
+    pub rotation: Matrix3<f32>,      // row-major
+    pub translation: Vector3<f32>,
+}

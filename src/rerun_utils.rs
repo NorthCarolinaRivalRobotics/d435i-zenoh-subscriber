@@ -2,7 +2,6 @@ use bytemuck::cast_slice;
 use rerun::{
     archetypes::DepthImage, datatypes::ChannelDatatype, EncodedImage, RecordingStream
 };
-
 use crate::types::DepthFrameRealUnits;
 
 /// Log a floating-point depth frame (metres) to Rerun.
@@ -20,6 +19,15 @@ pub fn log_depth(rec: &RecordingStream, frame: &DepthFrameRealUnits) -> anyhow::
 
     // 3. send it:
     rec.log("/camera/depth", &depth)?;
+    Ok(())
+}
+
+
+pub fn log_aligned_depth(rec: &RecordingStream, data: &[f32], w: usize, h: usize) -> anyhow::Result<()> {
+    let raw: &[u8] = bytemuck::cast_slice(data);
+    let depth = DepthImage::from_data_type_and_bytes(
+    raw.to_vec(), [w as u32, h as u32], ChannelDatatype::F32).with_meter(1.0);
+    rec.log("/camera/depth_aligned", &depth)?;
     Ok(())
 }
 

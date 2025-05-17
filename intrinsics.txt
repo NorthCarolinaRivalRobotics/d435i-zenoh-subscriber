@@ -1,0 +1,3 @@
+depth Ok(Rs2Intrinsics(rs2_intrinsics { width: 640, height: 480, ppx: 322.1206, ppy: 236.50139, fx: 387.31454, fy: 387.31454, model: 4, coeffs: [0.0, 0.0, 0.0, 0.0, 0.0] }))
+rgb Ok(Rs2Intrinsics(rs2_intrinsics { width: 640, height: 480, ppx: 316.65408, ppy: 244.13338, fx: 607.2676, fy: 607.149, model: 2, coeffs: [0.0, 0.0, 0.0, 0.0, 0.0] }))
+depth to rgb: Ok(Rs2Extrinsics(rs2_extrinsics { rotation: [0.9999627, -0.008320532, 0.0023323754, 0.008310333, 0.999956, 0.0043491516, -0.00236846, -0.0043296064, 0.99998784], translation: [0.014476319, 0.0001452052, 0.00031550066] }))

@@ -1,9 +1,12 @@
-use rerun_utils::{log_depth, log_rgb_jpeg};
-use types::{ColorFrameSerializable, DepthFrameSerializable};
+use nalgebra::{Matrix3, Vector3};
+use rerun_utils::{log_aligned_depth, log_depth, log_rgb_jpeg};
+use types::{ColorFrameSerializable, DepthFrameSerializable, Extrinsics, Intrinsics};
 use std::time::{Duration, Instant};
 use snap::raw::Decoder;
 mod types;
 mod rerun_utils;
+mod reproject;
+
 
 #[tokio::main]
 async fn main() {
@@ -11,6 +14,24 @@ async fn main() {
     let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
     let depth_subscriber = session.declare_subscriber("camera/depth").await.unwrap();
     let color_subscriber = session.declare_subscriber("camera/rgb").await.unwrap();
+
+    let d_intr = Intrinsics { width: 640, height: 480,
+        fx: 387.31454, fy: 387.31454,
+        ppx: 322.1206, ppy: 236.50139 };
+
+    let c_intr = Intrinsics { width: 640, height: 480,
+            fx: 607.2676, fy: 607.149,
+            ppx: 316.65408, ppy: 244.13338 };
+
+
+    let extr = Extrinsics {
+        rotation: Matrix3::from_row_slice(&[
+            0.9999627, -0.008320532,  0.0023323754,
+            0.008310333,  0.999956,   0.0043491516,
+        -0.00236846,  -0.0043296064, 0.99998784]),
+        translation: Vector3::new(0.014476319, 0.0001452052, 0.00031550066),
+    };
+
 
     let rec_depth = rec.clone();
     let depth_task = tokio::spawn(async move {
@@ -27,11 +48,13 @@ async fn main() {
 
                     let decode_start = Instant::now();
                     let depth_frame = DepthFrameSerializable::decodeAndDecompress(sample.payload().to_bytes().to_vec());
+                    let reprojected_depth = reproject::align_depth_to_color(&depth_frame, &d_intr, &c_intr, &extr);
                     let decode_duration = decode_start.elapsed();
                     println!("Depth decode time: {:?}", decode_duration);
 
                     let log_depth_start = Instant::now();
                     log_depth(&rec_depth, &depth_frame).unwrap();
+                    log_aligned_depth(&rec_depth, &reprojected_depth.data, reprojected_depth.width, reprojected_depth.height).unwrap();
                     let log_depth_duration = log_depth_start.elapsed();
                     println!("log_depth time: {:?}", log_depth_duration);
                     
