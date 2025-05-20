@@ -42,6 +42,7 @@ pub struct DepthFrameSerializable {
     pub data: Vec<u16>, // distances in meters
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Encode, Decode)]
 pub struct DepthFrameRealUnits {
     pub width: usize,
     pub height: usize,
@@ -161,5 +162,22 @@ impl MotionFrameData {
         let (wire, _): (MotionFrameData, _) =
         bincode::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         wire
+    }
+}
+
+/// Anything that carries a timestamp can go through the channel.
+#[derive(Clone)]
+pub enum Frame {
+    Depth(DepthFrameRealUnits),
+    Color((Vec<u8>, f64)),        // jpeg + ts   (your current return from ColorFrameSerializable)
+    Motion(MotionFrameData),
+}
+impl Frame {
+    pub fn ts(&self) -> f64 {
+        match self {
+            Frame::Depth(d)     => d.timestamp,
+            Frame::Color((_,t)) => *t,
+            Frame::Motion(m)    => m.timestamp,
+        }
     }
 }
