@@ -1,6 +1,6 @@
 use nalgebra::{Matrix3, Vector3};
 use rerun_utils::{log_aligned_depth, log_depth, log_rgb_jpeg};
-use types::{ColorFrameSerializable, DepthFrameSerializable, Extrinsics, Intrinsics};
+use types::{ColorFrameSerializable, DepthFrameSerializable, Extrinsics, Intrinsics, MotionFrameData};
 use std::time::{Duration, Instant};
 use snap::raw::Decoder;
 mod types;
@@ -14,6 +14,7 @@ async fn main() {
     let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
     let depth_subscriber = session.declare_subscriber("camera/depth").await.unwrap();
     let color_subscriber = session.declare_subscriber("camera/rgb").await.unwrap();
+    let motion_subscriber = session.declare_subscriber("camera/motion").await.unwrap();
 
     let d_intr = Intrinsics { width: 640, height: 480,
         fx: 387.31454, fy: 387.31454,
@@ -100,8 +101,27 @@ async fn main() {
         }
     });
 
+    let rec_motion = rec.clone();
+    let motion_task = tokio::spawn(async move {
+        loop {
+            let loop_start_time = Instant::now();
+            match motion_subscriber.recv_async().await {
+                Ok(sample) => {
+                    let motion_frame = MotionFrameData::decodeAndDecompress(sample.payload().to_bytes().to_vec());
+                    println!("Motion: {:?}", motion_frame);
+                }
+                Err(_) => {
+                    println!("Motion stream closed");
+                    break;
+                }
+            }
+        }
+    });
+    
+
+
     // Wait for both tasks to complete
     // If they are infinite loops, this will run indefinitely unless one of them errors out or breaks.
-    let _ = tokio::try_join!(depth_task, color_task);
+    let _ = tokio::try_join!(depth_task, color_task, motion_task);
 }
 
