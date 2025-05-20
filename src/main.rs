@@ -2,10 +2,10 @@ use nalgebra::{Matrix3, Vector3};
 use rerun_utils::{log_aligned_depth, log_depth, log_rgb_jpeg};
 use types::{ColorFrameSerializable, DepthFrameSerializable, Extrinsics, Intrinsics, MotionFrameData};
 use std::time::{Duration, Instant};
-use snap::raw::Decoder;
 mod types;
 mod rerun_utils;
 mod reproject;
+mod odom;
 
 
 #[tokio::main]
@@ -101,10 +101,8 @@ async fn main() {
         }
     });
 
-    let rec_motion = rec.clone();
     let motion_task = tokio::spawn(async move {
         loop {
-            let loop_start_time = Instant::now();
             match motion_subscriber.recv_async().await {
                 Ok(sample) => {
                     let motion_frame = MotionFrameData::decodeAndDecompress(sample.payload().to_bytes().to_vec());

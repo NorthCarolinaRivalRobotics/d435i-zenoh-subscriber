@@ -1,19 +1,14 @@
 use bincode::{Decode, Encode};
 use serde::Deserialize;
 use serde::Serialize;
-use snap::raw::Decoder;
 use snap::raw::Encoder;
-use turbojpeg::decompress_image;
 use turbojpeg::image::Rgb;
 use zstd::stream::copy_decode;
 use zstd::stream::copy_encode;
-use zstd::zstd_safe::compress;
-use zstd::zstd_safe::decompress;
 use turbojpeg::Subsamp;
 use turbojpeg::compress_image;
 use turbojpeg::image::ImageBuffer;
 
-use crate::rerun_utils::log_rgb_jpeg;
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum ImageEncoding {
     RGB8,

@@ -10,6 +10,7 @@ bytemuck = "1.23.0"
 features = "0.10.0"
 nalgebra = { version = "0.33.2", features = ["std"] }
 ndarray = "0.16.1"
+opencv = "0.94.4"
 rerun = "0.23.2"
 serde = { version = "1.0.219", features = ["derive"] }
 snap = "1.1.1"
