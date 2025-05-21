@@ -6,7 +6,7 @@ use ordered_float::OrderedFloat;
 use crate::types::{Frame};
 use crate::odometry::StampedTriple;
 
-const TOL: f64 = 0.05;      // 5 ms tolerance. tune later.
+const TOL: f64 = 0.1;      // 50 ms tolerance. tune later.
 type Stamp = OrderedFloat<f64>;      // one alias, readable later
 
 pub async fn run(
