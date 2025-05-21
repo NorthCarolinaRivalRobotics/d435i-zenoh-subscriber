@@ -6,7 +6,7 @@ use ordered_float::OrderedFloat;
 use crate::types::{Frame};
 use crate::odometry::StampedTriple;
 
-const TOL: f64 = 0.005;      // 5 ms tolerance. tune later.
+const TOL: f64 = 0.05;      // 5 ms tolerance. tune later.
 type Stamp = OrderedFloat<f64>;      // one alias, readable later
 
 pub async fn run(
@@ -20,7 +20,9 @@ pub async fn run(
         Default::default();
 
     while let Some(frm) = rx.recv().await {
-        let ts = Stamp::from(frm.ts());              // <-- wrap here
+        let ts_sec = frm.ts() / 1_000.0;
+        let ts     = Stamp::from(ts_sec);
+    
         match &frm {
             Frame::Depth(_)  => { depth_q.insert(ts, frm);  }
             Frame::Color(_)  => { color_q.insert(ts, frm);  }
@@ -30,6 +32,20 @@ pub async fn run(
         if let Some((&t, _)) = depth_q.iter().next() {
             let colour = nearest(&color_q, t);
             let motion = nearest(&motion_q, t);
+            if depth_q.len() % 60 == 0 {          // once per ~2 s at 30 FPS
+                let t = *depth_q.keys().next().unwrap();
+                let dc  = nearest(&color_q,  t);
+                let dm  = nearest(&motion_q, t);
+                println!(
+                    "earliest D={:.6}  nearest C={:?}  M={:?}   Δdc={:.3} ms  Δdm={:.3} ms",
+                    t.into_inner(),
+                    dc.map(|x| x.into_inner()),
+                    dm.map(|x| x.into_inner()),
+                    dc.map_or(-1.0, |x| (x.into_inner()-t.into_inner())*1e3),
+                    dm.map_or(-1.0, |x| (x.into_inner()-t.into_inner())*1e3),
+                );
+            }
+            
             if let (Some(tc), Some(tm)) = (colour, motion) {
                 if (t.into_inner() - tc.into_inner()).abs() < TOL
                     && (t.into_inner() - tm.into_inner()).abs() < TOL
@@ -37,7 +53,7 @@ pub async fn run(
                     let depth  = match depth_q.remove(&t).unwrap()  { Frame::Depth(d) => d, _ => unreachable!() };
                     let colour = match color_q.remove(&tc).unwrap() { Frame::Color(c) => c, _ => unreachable!() };
                     let motion = match motion_q.remove(&tm).unwrap(){ Frame::Motion(m)=> m, _ => unreachable!() };
-                    let triple = StampedTriple { depth, colour, motion };
+                    let triple: StampedTriple = StampedTriple { depth, colour, motion };
                     let _ = odom_tx.send(triple);
                 }
             }
