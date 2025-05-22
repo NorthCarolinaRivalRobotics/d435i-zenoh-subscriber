@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, path::Path, time::Instant};
 use rerun::{dataframe::TimelineName, TimeCell};
 use tokio::{sync::mpsc::UnboundedSender, time::sleep};
 use byteorder::{LittleEndian, ReadBytesExt, LE};
-use crate::{rerun_utils::{log_aligned_depth, log_rgb_jpeg}, types::{DepthFrameSerializable, Frame, MotionFrameData}};
+use crate::{rerun_utils::{log_aligned_depth, log_rgb_jpeg}, types::{CombinedFrameWire, DepthFrameRealUnits, DepthFrameSerializable, Frame, MotionFrameData}};
 
 /// Sleep until `desired_since_start` seconds have really passed since `wall_start`.
 async fn pace(desired_since_start: f64, wall_start: &Instant) {
@@ -15,9 +15,16 @@ async fn pace(desired_since_start: f64, wall_start: &Instant) {
     }
 }
 
+pub fn decode_u16_to_meters(val: u16) -> f32 {
+    val as f32 / 1000.0 // Assuming depth values are in millimeters
+}
+
 pub async fn playback(path: &Path, tx: UnboundedSender<Frame>) -> std::io::Result<()> {
     // create a Rerun recording just for playback visualisation
     let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
+
+    const KIND_COMBINED: u8 = 0;
+    const KIND_MOTION: u8 = 1;
 
     let mut f = std::io::BufReader::new(File::open(path).unwrap());
     let mut start_ts: Option<f64> = None;
@@ -46,32 +53,34 @@ pub async fn playback(path: &Path, tx: UnboundedSender<Frame>) -> std::io::Resul
         let time = ts - start_ts.unwrap();
         println!("reader: time {}", time);
 
-
-
         // rebuild the frame *in seconds*
-        let frame = match kind {
-            0 => {
-                let mut d = DepthFrameSerializable::decodeAndDecompress(buf);
-                d.timestamp = ts;
-                // log for rerun
-                log_aligned_depth(&rec, &d.data, d.width, d.height).ok();
-                Frame::Depth(d)
-            }
-            1 => {
-                log_rgb_jpeg(&rec, &buf).ok();
-                Frame::Color((buf, ts))
-            }
-            2 => {
-                let mut m = MotionFrameData::decodeAndDecompress(buf);
-                m.timestamp = ts;
-                println!("reader: motion frame {}", m.gyro[0]);
-                Frame::Motion(m)
-            }
-            _ => unreachable!(),
-        };
+        match kind {
+            KIND_COMBINED => {
+                let frame_wire = CombinedFrameWire::decode(&buf);
+                let (rgb, depth, w, h, ts) = frame_wire.unpack();
 
-        // **send to the synchroniser's channel**
-        let _ = tx.send(frame);
+                // push into the live pipeline exactly as the network path does
+                let depth_ru = DepthFrameRealUnits {
+                    width: w as usize,
+                    height: h as usize,
+                    timestamp: ts,
+                    data: depth.iter().map(|c| decode_u16_to_meters(*c)).collect(),
+                };
+                log_aligned_depth(&rec, &depth_ru.data, w as usize, h as usize).ok();
+                log_rgb_jpeg(&rec, &frame_wire.rgb_jpeg).ok();
+
+                let _ = tx.send(Frame::Depth(depth_ru.clone()));
+                let _ = tx.send(Frame::Color((frame_wire.rgb_jpeg.clone(), ts)));
+            }
+
+            KIND_MOTION => {
+                let m = MotionFrameData::decodeAndDecompress(buf);
+                let _ = tx.send(Frame::Motion(m));
+            }
+
+            _ => unreachable!(),
+        }
+        
         println!("reader: pushed frame");
     }
     Ok(())

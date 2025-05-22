@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 use clap::Parser;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 mod types;
 mod rerun_utils;
 mod reproject;
@@ -99,6 +100,14 @@ async fn main() {
         Some(zenoh::open(zenoh::Config::default()).await.unwrap())
     };
 
+    // Optional log path that will be used to create a shared logger
+    let shared_logger = match &mode {
+        cli::RunMode::LiveWithLog(path) => {
+            Some(Arc::new(Mutex::new(logio::writer::LogWriter::new(path).unwrap())))
+        },
+        _ => None,
+    };
+
     // 3. live or playback source
     match mode.clone() {
         cli::RunMode::Playback(path) => {
@@ -128,28 +137,11 @@ async fn main() {
                 translation: Vector3::new(0.014476319, 0.0001452052, 0.00031550066),
             };
 
-            // Optional log path that will be used to create loggers for each task
-            let log_path = match &mode {
-                cli::RunMode::LiveWithLog(path) => Some(path.clone()),
-                _ => None,
-            };
-
             // combined depth+color task
             let tx = raw_tx.clone();
             let rec_clone = rec.clone();
-            let combined_log_path = log_path.clone();
+            let combined_logger = shared_logger.clone();
             let combined_task = tokio::spawn(async move {
-                // Create loggers if path was provided
-                let mut depth_logger = match &combined_log_path {
-                    Some(path) => Some(logio::writer::LogWriter::new(&path).unwrap()),
-                    None => None,
-                };
-                
-                let mut color_logger = match &combined_log_path {
-                    Some(path) => Some(logio::writer::LogWriter::new(&path).unwrap()),
-                    None => None,
-                };
-                
                 let mut last_print_time = Instant::now();
                 let mut frame_count = 0u32;
                 const FPS_PRINT_INTERVAL: Duration = Duration::from_secs(1);
@@ -157,8 +149,23 @@ async fn main() {
                 loop {
                     match combined_subscriber.recv_async().await {
                         Ok(sample) => {
-                            let payload_bytes = sample.payload().to_bytes().to_vec();
-                            let combined_frame = CombinedFrameWire::decode(&payload_bytes);
+                            let payload = sample.payload().to_bytes().to_vec();
+                            
+                            // 1️⃣ Write the raw packet immediately if logger exists
+                            if let Some(logger) = &combined_logger {
+                                // Use current time if sample timestamp is not available
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                
+                                // Acquire mutex lock before writing
+                                let mut log_writer = logger.lock().await;
+                                log_writer.write_combined(now, &payload).unwrap();
+                            }
+                            
+                            // 2️⃣ Normal unpacking & processing
+                            let combined_frame = CombinedFrameWire::decode(&payload);
                             
                             // Unpack the combined frame
                             if let Some((rgb_raw, depth_raw, width, height, timestamp)) = unpack_combined_frame(&combined_frame) {
@@ -180,10 +187,6 @@ async fn main() {
                                 // Send to processing pipeline
                                 let _ = tx.send(depth_frame.clone());
                                 let _ = tx.send(color_frame.clone());
-                                
-                                // Log to respective writers if enabled
-                                if let Some(writer) = depth_logger.as_mut() { writer.write(&depth_frame).unwrap(); }
-                                if let Some(writer) = color_logger.as_mut() { writer.write(&color_frame).unwrap(); }
                                 
                                 // Log to rerun for visualization
                                 log_depth(&rec_clone, &depth_real_units).unwrap();
@@ -213,22 +216,23 @@ async fn main() {
 
             // motion task
             let tx = raw_tx.clone();
-            let motion_log_path = log_path.clone();
+            let motion_logger = shared_logger.clone();
             let motion_task = tokio::spawn(async move {
-                // Create logger if path was provided
-                let mut motion_logger = match motion_log_path {
-                    Some(path) => Some(logio::writer::LogWriter::new(&path).unwrap()),
-                    None => None,
-                };
-                
                 loop {
                     match motion_subscriber.recv_async().await {
                         Ok(sample) => {
-                            let motion_frame = MotionFrameData::decodeAndDecompress(sample.payload().to_bytes().to_vec());                            
+                            let payload = sample.payload().to_bytes().to_vec();
+                            let motion_frame = MotionFrameData::decodeAndDecompress(payload);                            
                             // Send to channel
                             let frame = Frame::Motion(motion_frame.clone());
                             let _ = tx.send(frame.clone());
-                            if let Some(writer) = motion_logger.as_mut() { writer.write(&frame).unwrap(); }
+                            
+                            // Write to log if logger exists
+                            if let Some(logger) = &motion_logger {
+                                // Acquire mutex lock before writing
+                                let mut log_writer = logger.lock().await;
+                                log_writer.write_motion(&motion_frame).unwrap();
+                            }
                         }
                         Err(_) => {
                             println!("Motion stream closed");
