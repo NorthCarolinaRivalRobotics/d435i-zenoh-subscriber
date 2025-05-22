@@ -10,6 +10,7 @@ bytemuck = "1.23.0"
 byteorder = "1.5.0"
 clap = { version = "4.5.38", features = ["derive"] }
 features = "0.10.0"
+itertools = "0.14.0"
 nalgebra = { version = "0.33.2", features = ["std"] }
 ndarray = "0.16.1"
 ordered-float = "5.0.0"

@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use snap::raw::Encoder;
 use turbojpeg::image::Rgb;
+use zstd::decode_all;
 use zstd::stream::copy_decode;
 use zstd::stream::copy_encode;
 use turbojpeg::Subsamp;
@@ -38,16 +39,16 @@ pub fn decode_u16_to_meters(code: u16) -> f32 {
 pub struct DepthFrameSerializable {
     pub width: usize,
     pub height: usize,
-    pub timestamp: f64,
     pub data: Vec<u16>, // distances in meters
+    pub timestamp: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Encode, Decode)]
 pub struct DepthFrameRealUnits {
     pub width: usize,
     pub height: usize,
-    pub timestamp: f64,
     pub data: Vec<f32>, // distances in meters
+    pub timestamp: f64,
 }
 
 #[derive(Encode, Decode)]
@@ -61,8 +62,8 @@ pub struct ImageForWire {
 pub struct ColorFrameSerializable {
     pub width: usize,
     pub height: usize,
-    pub timestamp: f64,
     pub data: Vec<u8>, // RGB8
+    pub timestamp: f64,
 }
 
 
@@ -179,5 +180,48 @@ impl Frame {
             Frame::Color((_,t)) => *t,
             Frame::Motion(m)    => m.timestamp,
         }
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+pub struct CombinedFrameWire {
+    /// JPEG-compressed RGB image
+    pub rgb_jpeg: Vec<u8>,
+    /// Zstd-compressed depth buffer (u16)
+    pub depth_zstd: Vec<u8>,
+    pub width:  u16,
+    pub height: u16,
+    pub timestamp: f64,          // seconds, SYSTEM_TIME domain
+}
+
+impl CombinedFrameWire {
+
+    /// final packing for the wire
+    pub fn encode(&self) -> Vec<u8> {
+        let payload = bincode::encode_to_vec(self, bincode::config::standard()).unwrap();
+        // a light Zstd pass mainly helps small RGB frames; level-1 keeps latency down
+        let mut out = Vec::new();
+        copy_encode(&payload[..], &mut out, 1).unwrap();
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Self {
+        let raw = decode_all(buf).unwrap();
+        let (me, _): (CombinedFrameWire, _) =
+            bincode::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+        me
+    }
+
+    // helper to get fully-expanded data back out
+    pub fn unpack(&self) -> (Vec<u8>, Vec<u16>, u16, u16, f64) {
+        let rgb_raw = turbojpeg::decompress_image::<Rgb<u8>>(&self.rgb_jpeg).unwrap().into_raw();
+        let depth_raw = {
+            let bytes = decode_all(&self.depth_zstd[..]).unwrap();
+            let (d, _): (DepthFrameSerializable, _) =
+                bincode::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            d.data
+        };
+        (rgb_raw, depth_raw, self.width, self.height, self.timestamp)
     }
 }

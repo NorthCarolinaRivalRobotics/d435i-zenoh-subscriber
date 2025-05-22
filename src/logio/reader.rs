@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, path::Path, time::Instant};
 use rerun::{dataframe::TimelineName, TimeCell};
 use tokio::{sync::mpsc::UnboundedSender, time::sleep};
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, LE};
 use crate::{rerun_utils::{log_aligned_depth, log_rgb_jpeg}, types::{DepthFrameSerializable, Frame, MotionFrameData}};
 
 /// Sleep until `desired_since_start` seconds have really passed since `wall_start`.
@@ -17,33 +17,36 @@ async fn pace(desired_since_start: f64, wall_start: &Instant) {
 
 pub async fn playback(path: &Path, tx: UnboundedSender<Frame>) -> std::io::Result<()> {
     // create a Rerun recording just for playback visualisation
-    let rec = rerun::RecordingStreamBuilder::new("d435i_playback").spawn().unwrap();
+    let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
 
-    let mut f = std::io::BufReader::new(File::open(path)?);
+    let mut f = std::io::BufReader::new(File::open(path).unwrap());
     let mut start_ts: Option<f64> = None;
     let mut wall_start: Option<Instant> = None;
 
     loop {
-        let kind = match f.read_u8() { Ok(k) => k, Err(_) => break };
-        let ts   = f.read_f64::<LittleEndian>()? ; // validated with printing that this is in seconds 
-        let ts_ns = (ts * 1e9) as i64;
-        
-        let ts_sec = ts;          // already seconds
+        // read the header
+        let kind   = match f.read_u8() { Ok(k) => k, Err(_) => break };
+        // ‼️ correct order: timestamp THEN length
+        let ts_ms  = f.read_f64::<LittleEndian>()?;           // <- 8 bytes
+        let len    = f.read_u32::<LittleEndian>()? as usize;  // <- 4 bytes
+        let ts    = ts_ms / 1_000.0;
+        println!("kind={kind}, ts={ts}, len={len}");
+
         if start_ts.is_none() {
-            start_ts = Some(ts_sec);
+            start_ts = Some(ts);
             wall_start = Some(Instant::now());
         }
 
-        let desired = ts_sec - start_ts.unwrap();
+        let desired = ts - start_ts.unwrap();
         pace(desired, &wall_start.as_ref().unwrap()).await;
         
-        let len  = f.read_u32::<LittleEndian>()? as usize;
         let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf)?;
+        f.read_exact(&mut buf).unwrap();
 
-        let time = ts_ns - (start_ts.unwrap() * 1e9) as i64;
-        println!("reader: time {}", time as f64 / 1e9 as f64);
-        rec.set_duration_secs(TimelineName::log_time(), ts);
+        let time = ts - start_ts.unwrap();
+        println!("reader: time {}", time);
+
+
 
         // rebuild the frame *in seconds*
         let frame = match kind {
@@ -61,6 +64,7 @@ pub async fn playback(path: &Path, tx: UnboundedSender<Frame>) -> std::io::Resul
             2 => {
                 let mut m = MotionFrameData::decodeAndDecompress(buf);
                 m.timestamp = ts;
+                println!("reader: motion frame {}", m.gyro[0]);
                 Frame::Motion(m)
             }
             _ => unreachable!(),

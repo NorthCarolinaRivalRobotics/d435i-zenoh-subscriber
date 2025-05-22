@@ -10815,6 +10815,7 @@ dependencies = [
  "byteorder",
  "clap",
  "features",
+ "itertools 0.14.0",
  "nalgebra",
  "ndarray",
  "ordered-float 5.0.0",
