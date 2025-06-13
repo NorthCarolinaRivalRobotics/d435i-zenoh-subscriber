@@ -14,6 +14,7 @@ mod sync;
 mod cli;
 mod odometry;
 mod logio;
+mod rgbd_odom;
 
 use std::{fs::File, io::{BufReader, Read}};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -86,12 +87,12 @@ async fn main() {
     let (odom_tx, odom_rx) = unbounded_channel::<odometry::StampedTriple>();
 
     // 1. spawn synchroniser
+    let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
     tokio::spawn(sync::run(raw_rx, odom_tx));
 
     // 2. spawn odometry consumer
-    tokio::spawn(odometry::run(odom_rx));
+    tokio::spawn(odometry::run(odom_rx, rec.clone()));
 
-    let rec = rerun::RecordingStreamBuilder::new("d435i").spawn().unwrap();
 
     // create if we're in a live mode, otherwise None
     let live_session = if matches!(mode, cli::RunMode::Playback(_)) {
@@ -181,7 +182,7 @@ async fn main() {
                                 let reprojected_depth = reproject::align_depth_to_color(&depth_real_units, &d_intr, &c_intr, &extr);
 
                                 // Send frames to channels
-                                let depth_frame = Frame::Depth(depth_real_units.clone());
+                                let depth_frame = Frame::Depth(reprojected_depth.clone());
                                 let color_frame = Frame::Color((combined_frame.rgb_jpeg.clone(), timestamp));
                                 
                                 // Send to processing pipeline

@@ -34,6 +34,6 @@ pub fn log_aligned_depth(rec: &RecordingStream, data: &[f32], w: usize, h: usize
 pub fn log_rgb_jpeg(rec: &RecordingStream, jpeg: &[u8]) -> anyhow::Result<()> {
     let img = EncodedImage::from_file_contents(jpeg.to_vec())  // alloc once
         .with_media_type("image/jpeg");                       // explicit is faster
-    rec.log("/camera/rgb", &img)?;
+    rec.log("/world/camera/", &img)?;
     Ok(())
 }

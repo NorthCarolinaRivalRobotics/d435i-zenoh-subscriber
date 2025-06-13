@@ -10,15 +10,21 @@ bytemuck = "1.23.0"
 byteorder = "1.5.0"
 clap = { version = "4.5.38", features = ["derive"] }
 features = "0.10.0"
+image = "0.25.6"
 itertools = "0.14.0"
 kornia = "0.1.9"
+kornia-icp = "0.1.9"
+kornia-3d = "0.1.9"
 nalgebra = { version = "0.33.2", features = ["std"] }
 ndarray = "0.16.1"
 ordered-float = "5.0.0"
+rand = "0.8"
+rayon = "1.10.0"
 rerun = "0.23.2"
 serde = { version = "1.0.219", features = ["derive"] }
 snap = "1.1.1"
 tokio = "1.45.0"
+tracing = "0.1"
 turbojpeg = { version = "1.3.3", features = ["image"] }
 zenoh = "1.3.4"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
