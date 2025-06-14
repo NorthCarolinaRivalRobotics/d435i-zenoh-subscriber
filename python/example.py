@@ -7,6 +7,7 @@ Simple polling-based API - just call get_latest_frames() to get the latest data!
 import zenoh_d435i_subscriber as zd435i
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 
 def main():
     print("🚀 Starting Zenoh D435i Subscriber Example")
@@ -34,6 +35,9 @@ def main():
     print(f"📷 Set intrinsics - Depth: {depth_intrinsics}")
     print(f"📷 Set intrinsics - Color: {color_intrinsics}")
     
+    # Flag to track if we've plotted the first depth image
+    first_depth_plotted = False
+    
     try:
         # Connect to Zenoh
         print("🔌 Connecting to Zenoh...")
@@ -50,6 +54,7 @@ def main():
         print("="*60)
         print("💡 The subscriber is now running in the background.")
         print("💡 We'll poll for the latest data every second.")
+        print("💡 The first depth image will be plotted and saved.")
         print("💡 Press Ctrl+C to stop.\n")
         
         last_frame_count = 0
@@ -68,7 +73,53 @@ def main():
                     print(f"  📸 RGB: {len(rgb_data)} bytes ({frame_data.rgb.width}x{frame_data.rgb.height})")
                 
                 # Process Depth data if available
-                if frame_data.depth:
+                if frame_data.depth and not first_depth_plotted:
+                    depth_array = frame_data.depth.get_data()
+                    depth_2d = frame_data.depth.get_data_2d()
+                    depth_min, depth_max = np.min(depth_array), np.max(depth_array)
+                    print(f"  🎯 Depth: {depth_2d.shape} array, range: {depth_min:.3f}-{depth_max:.3f}m")
+                    
+                    # Plot the first depth image
+                    print("  📊 Plotting first depth image...")
+                    plt.figure(figsize=(12, 8))
+                    
+                    # Create subplot for depth visualization
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(depth_2d, cmap='viridis', vmin=0, vmax=np.percentile(depth_2d[depth_2d > 0], 95))
+                    plt.colorbar(label='Depth (m)')
+                    plt.title(f'First Depth Image\n{depth_2d.shape[1]}x{depth_2d.shape[0]} pixels')
+                    plt.xlabel('X (pixels)')
+                    plt.ylabel('Y (pixels)')
+                    
+                    # Create histogram of depth values
+                    plt.subplot(1, 2, 2)
+                    valid_depths = depth_2d[depth_2d > 0]  # Only non-zero depths
+                    if len(valid_depths) > 0:
+                        plt.hist(valid_depths, bins=50, alpha=0.7, edgecolor='black')
+                        plt.xlabel('Depth (m)')
+                        plt.ylabel('Pixel Count')
+                        plt.title(f'Depth Distribution\nValid pixels: {len(valid_depths):,}')
+                        plt.axvline(np.mean(valid_depths), color='red', linestyle='--', 
+                                   label=f'Mean: {np.mean(valid_depths):.3f}m')
+                        plt.axvline(np.median(valid_depths), color='orange', linestyle='--', 
+                                   label=f'Median: {np.median(valid_depths):.3f}m')
+                        plt.legend()
+                    
+                    plt.tight_layout()
+                    
+                    # Save the plot
+                    filename = f'first_depth_image_{int(time.time())}.png'
+                    plt.savefig(filename, dpi=150, bbox_inches='tight')
+                    print(f"  💾 Saved depth image as: {filename}")
+                    
+                    # Show the plot
+                    # plt.show()
+                    
+                    first_depth_plotted = True
+                    print("  ✅ First depth image plotted and saved!")
+                
+                elif frame_data.depth:
+                    # Just print stats for subsequent depth frames
                     depth_array = frame_data.depth.get_data()
                     depth_2d = frame_data.depth.get_data_2d()
                     depth_min, depth_max = np.min(depth_array), np.max(depth_array)
@@ -89,7 +140,6 @@ def main():
                 else:
                     print(f"📊 {subscriber.get_stats()}")
             
-            time.sleep(1)
             
     except KeyboardInterrupt:
         print("\n🛑 Stopping subscriber...")

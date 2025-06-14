@@ -23,8 +23,7 @@ dev = [
 ]
 
 [tool.maturin]
-python-source = "python"
-module-name = "zenoh_d435i_subscriber"
+features = ["pyo3/extension-module"]
 
 [project.urls]
 Repository = "https://github.com/your-username/zenoh-d435i-subscriber" 
