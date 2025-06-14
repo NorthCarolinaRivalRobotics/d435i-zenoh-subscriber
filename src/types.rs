@@ -43,6 +43,13 @@ pub struct DepthFrameSerializable {
     pub timestamp: f64,
 }
 
+#[derive(Clone)]
+pub struct StampedTriple {
+    pub depth: DepthFrameRealUnits,
+    pub colour: (Vec<u8>, f64),        // jpeg + ts
+    pub motion: MotionFrameData,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Encode, Decode)]
 pub struct DepthFrameRealUnits {
     pub width: usize,
