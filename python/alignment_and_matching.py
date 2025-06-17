@@ -13,7 +13,7 @@ import numpy as np
 import zenoh_d435i_subscriber as zd435i
 
 from camera_config import CameraCalibration
-from vision_utils import estimate_frame_transform
+from vision_utils import CAMERA_TO_ROBOT_FRAME, estimate_frame_transform
 from visualization import RerunVisualizer
 from profiling import profiler
 
@@ -43,6 +43,18 @@ def main() -> None:
     processing_times = []
     last_stats_time = time.time()
 
+    # SE(3) matrix at 0 rotation and 0 translation
+    T_Accumulated = np.array([[1.0, 0.0, 0.0, 0.0],
+                              [0.0, 1.0, 0.0, 0.0],
+                              [0.0, 0.0, 1.0, 0.0],
+                              [0.0, 0.0, 0.0, 1.0]])
+    
+    # Accumulate in camera coordinates first, then transform
+    T_Accumulated_Camera = np.array([[1.0, 0.0, 0.0, 0.0],
+                                     [0.0, 1.0, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, 0.0],
+                                     [0.0, 0.0, 0.0, 1.0]])
+
     try:
         while sub.is_running():
             frame_start = time.perf_counter()
@@ -59,16 +71,21 @@ def main() -> None:
 
             # Process frame data
             with profiler.timer("image_decoding"):
-                rgb_buf = fd.rgb.get_data()
-                w, h = fd.rgb.width, fd.rgb.height
+                try:
+                    rgb_buf = fd.rgb.get_data()
+                    w, h = fd.rgb.width, fd.rgb.height
 
-                # Decode RGB image
-                rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
-                if rgb_bgr is None:
-                    rgb_bgr = np.frombuffer(rgb_buf, np.uint8).reshape((h, w, 3))
+                    # Decode RGB image
+                    rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
+                    if rgb_bgr is None:
+                        rgb_bgr = np.frombuffer(rgb_buf, np.uint8).reshape((h, w, 3))
 
-                rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-                depth_img = fd.depth.get_data_2d().astype(np.float32)
+                    rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+                    depth_img = fd.depth.get_data_2d().astype(np.float32)
+                except Exception as e:
+                    print(f"Error decoding images: {e}")
+                    time.sleep(MIN_SLEEP_TIME)
+                    continue
 
             # Log basic frame data (this should be fast)
             with profiler.timer("visualization_basic"):
@@ -88,8 +105,10 @@ def main() -> None:
                         rgb_img, depth_img,
                         camera_cal.K_rgb, camera_cal.K_depth, 
                         camera_cal.T_rgb_to_depth, 
-                        depth_scale=1.0
+                        depth_scale=1.0  # Depth data is already in meters from decode_u16_to_meters()
                     )
+
+                    # print(f"Transform: {T}")
 
                     # Log feature matches
                     if len(P1) > 0:
@@ -100,6 +119,31 @@ def main() -> None:
                     if T is not None:
                         with profiler.timer("visualization_pose"):
                             visualizer.log_camera_pose(T, frame_id)
+                            
+                            # Debug: Print individual transform components
+                            print(f"Raw pose T translation: {T[:3, 3]}")
+                            print(f"Raw pose T scale (det): {np.linalg.det(T[:3, :3]):.6f}")
+                            
+                            # Apply coordinate transform
+                            T_robot = CAMERA_TO_ROBOT_FRAME @ T
+                            print(f"Robot frame translation: {T_robot[:3, 3]}")
+                            print(f"Robot frame scale (det): {np.linalg.det(T_robot[:3, :3]):.6f}")
+                            
+                            # Accumulate
+                            T_Accumulated_Camera = T_Accumulated_Camera @ T
+                            print(f"Accumulated Transform in Camera Coordinates:\n {T_Accumulated_Camera}")
+                            print(f"Accumulated position: {T_Accumulated_Camera[:3, 3]}")
+                            print(f"Position breakdown - X(fwd): {T_Accumulated_Camera[0,3]:.3f}, Y(left): {T_Accumulated_Camera[1,3]:.3f}, Z(up): {T_Accumulated_Camera[2,3]:.3f}")
+                            print(f"Total distance moved: {np.linalg.norm(T_Accumulated_Camera[:3, 3]):.3f}m")
+                            print("---")
+
+                            # Transform to robot frame
+                            T_Accumulated = CAMERA_TO_ROBOT_FRAME @ T_Accumulated_Camera
+                            print(f"Accumulated Transform in Robot Frame:\n {T_Accumulated}")
+                            print(f"Accumulated position: {T_Accumulated[:3, 3]}")
+                            print(f"Position breakdown - X(fwd): {T_Accumulated[0,3]:.3f}, Y(left): {T_Accumulated[1,3]:.3f}, Z(up): {T_Accumulated[2,3]:.3f}")
+                            print(f"Total distance moved: {np.linalg.norm(T_Accumulated[:3, 3]):.3f}m")
+                            print("---")
 
             # Update state for next iteration
             last_frame = {"rgb": rgb_img, "depth": depth_img, "id": fd.frame_count}

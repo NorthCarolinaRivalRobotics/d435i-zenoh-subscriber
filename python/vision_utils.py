@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from profiling import profiler
 
+MINIMUM_VALID_DEPTH = 0.55
+MAXIMUM_VALID_DEPTH = 7.0 
 
 def rgb_pixel_to_xyz(depth_reg: np.ndarray,
                      K_rgb: np.ndarray,
@@ -29,7 +31,7 @@ def estimate_frame_transform(rgb1: np.ndarray, depth1: np.ndarray,
                              rgb2: np.ndarray, depth2: np.ndarray,
                              K_rgb: np.ndarray, K_depth: np.ndarray,
                              T_rgb_depth: np.ndarray,
-                             depth_scale: float = 1000.0,
+                             depth_scale: float = 1.0,
                              n_keypoints: int = 800,
                              max_matches: int = 300):
     """
@@ -110,6 +112,10 @@ def estimate_frame_transform(rgb1: np.ndarray, depth1: np.ndarray,
                                      depth_scale)
             if p_xyz is None or q_xyz is None:
                 continue
+            if p_xyz[2] < MINIMUM_VALID_DEPTH or p_xyz[2] > MAXIMUM_VALID_DEPTH:
+                continue
+            if q_xyz[2] < MINIMUM_VALID_DEPTH or q_xyz[2] > MAXIMUM_VALID_DEPTH:
+                continue
             obj_pts.append(p_xyz)
             img_pts.append(kp2[m.trainIdx].pt)
             p2_pts.append(q_xyz)
@@ -134,3 +140,14 @@ def estimate_frame_transform(rgb1: np.ndarray, depth1: np.ndarray,
         T[:3, :3], T[:3, 3] = R, tvec.ravel()
     
     return obj_pts[inl.flatten()], p2_pts[inl.flatten()], T 
+
+
+# CAMERA_TO_ROBOT_FRAME = np.array([[ 0.0,  0.0,  1.0,  0.0],  # Robot X = Camera Z (forward)
+#                                   [-1.0,  0.0,  0.0,  0.0],  # Robot Y = -Camera X (right→left)
+#                                   [ 0.0, -1.0,  0.0,  0.0],  # Robot Z = -Camera Y (down→up)
+#                                   [ 0.0,  0.0,  0.0,  1.0]])
+
+CAMERA_TO_ROBOT_FRAME = np.array([[ 0.0,  0.0,  -1.0,  0.0],  # Robot X = Camera Z (forward)
+                                  [-1.0,  0.0,  0.0,  0.0],  # Robot Y = -Camera X (right→left)  
+                                  [ 0.0, 1.0,  0.0,  0.0],  # Robot Z = -Camera Y (down→up)
+                                  [ 0.0,  0.0,  0.0,  1.0]])
