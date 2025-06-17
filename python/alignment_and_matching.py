@@ -54,6 +54,10 @@ def main() -> None:
                                      [0.0, 1.0, 0.0, 0.0],
                                      [0.0, 0.0, 1.0, 0.0],
                                      [0.0, 0.0, 0.0, 1.0]])
+    
+    # Track camera trajectory positions
+    camera_trajectory = []
+    MAX_TRAJECTORY_LENGTH = 500  # Limit trajectory length for performance
 
     try:
         while sub.is_running():
@@ -118,6 +122,7 @@ def main() -> None:
                     # Log camera pose
                     if T is not None:
                         with profiler.timer("visualization_pose"):
+                            # Log the relative transform using the original method
                             visualizer.log_camera_pose(T, frame_id)
                             
                             # Debug: Print individual transform components
@@ -144,6 +149,27 @@ def main() -> None:
                             print(f"Position breakdown - X(fwd): {T_Accumulated[0,3]:.3f}, Y(left): {T_Accumulated[1,3]:.3f}, Z(up): {T_Accumulated[2,3]:.3f}")
                             print(f"Total distance moved: {np.linalg.norm(T_Accumulated[:3, 3]):.3f}m")
                             print("---")
+                            
+                            # Add current position to trajectory
+                            current_position = T_Accumulated_Camera[:3, 3]
+                            camera_trajectory.append(current_position.copy())
+                            
+                            # Limit trajectory length for performance
+                            if len(camera_trajectory) > MAX_TRAJECTORY_LENGTH:
+                                camera_trajectory = camera_trajectory[-MAX_TRAJECTORY_LENGTH:]
+                            
+                            # Log the current camera pose as a single pinhole camera
+                            visualizer.log_accumulated_camera_pose(
+                                T_accumulated=T_Accumulated_Camera,
+                                K=camera_cal.K_rgb,
+                                width=w,
+                                height=h,
+                                frame_id=frame_id
+                            )
+                            
+                            # Log the trajectory trail
+                            if len(camera_trajectory) > 1:
+                                visualizer.log_camera_trajectory(camera_trajectory)
 
             # Update state for next iteration
             last_frame = {"rgb": rgb_img, "depth": depth_img, "id": fd.frame_count}
