@@ -6,9 +6,14 @@ use tokio::runtime::Runtime;
 use std::time::{Duration, Instant};
 use nalgebra::{Matrix3, Vector3};
 use numpy::{PyArray1, PyArray2, IntoPyArray};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 mod types;
 use types::*;
+
+// Constants for latency optimization
+const MAX_QUEUED_FRAMES: usize = 2;  // Drop frames if queue gets too long
+const PROCESSING_TIMEOUT_MS: u64 = 50;  // Max time to spend on one frame
 
 /// Python wrapper for camera intrinsics
 #[pyclass]
@@ -109,11 +114,12 @@ impl PyRgbFrame {
     }
 }
 
-/// Python wrapper for depth frame
+/// Python wrapper for depth frame with lazy conversion
 #[pyclass]
 #[derive(Clone)]
 pub struct PyDepthFrame {
-    pub data: Vec<f32>,
+    pub raw_data: Vec<u16>,  // Store raw u16 data
+    converted_data: Option<Vec<f32>>,  // Cache converted data
     #[pyo3(get)]
     pub timestamp: f64,
     #[pyo3(get)]
@@ -122,21 +128,48 @@ pub struct PyDepthFrame {
     pub height: usize,
 }
 
-#[pymethods]
 impl PyDepthFrame {
-    fn get_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
-        PyArray1::from_vec_bound(py, self.data.clone())
+    fn new(raw_data: Vec<u16>, timestamp: f64, width: usize, height: usize) -> Self {
+        Self {
+            raw_data,
+            converted_data: None,
+            timestamp,
+            width,
+            height,
+        }
     }
     
-    fn get_data_2d<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let array = ndarray::Array2::from_shape_vec((self.height, self.width), self.data.clone())
+    fn ensure_converted(&mut self) {
+        if self.converted_data.is_none() {
+            self.converted_data = Some(
+                self.raw_data.iter().map(|&code| decode_u16_to_meters(code)).collect()
+            );
+        }
+    }
+}
+
+#[pymethods]
+impl PyDepthFrame {
+    fn get_data<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        self.ensure_converted();
+        PyArray1::from_vec_bound(py, self.converted_data.as_ref().unwrap().clone())
+    }
+    
+    fn get_data_2d<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        self.ensure_converted();
+        let data = self.converted_data.as_ref().unwrap();
+        let array = ndarray::Array2::from_shape_vec((self.height, self.width), data.clone())
             .map_err(|e| PyRuntimeError::new_err(format!("Shape error: {}", e)))?;
         Ok(array.into_pyarray_bound(py))
     }
     
+    fn get_raw_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u16>> {
+        PyArray1::from_vec_bound(py, self.raw_data.clone())
+    }
+    
     fn __repr__(&self) -> String {
         format!("PyDepthFrame({}x{}, {} points, timestamp={:.3})", 
-                self.width, self.height, self.data.len(), self.timestamp)
+                self.width, self.height, self.raw_data.len(), self.timestamp)
     }
 }
 
@@ -179,7 +212,26 @@ impl PyFrameData {
     }
 }
 
-/// Main Zenoh subscriber class with simple polling API
+/// Frame processing statistics
+struct ProcessingStats {
+    frames_received: AtomicU64,
+    frames_dropped: AtomicU64,
+    frames_processed: AtomicU64,
+    processing_queue_len: AtomicU64,
+}
+
+impl ProcessingStats {
+    fn new() -> Self {
+        Self {
+            frames_received: AtomicU64::new(0),
+            frames_dropped: AtomicU64::new(0),
+            frames_processed: AtomicU64::new(0),
+            processing_queue_len: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Main Zenoh subscriber class with optimized low-latency processing
 #[pyclass]
 pub struct ZenohD435iSubscriber {
     runtime: Arc<Runtime>,
@@ -187,8 +239,9 @@ pub struct ZenohD435iSubscriber {
     latest_rgb: Arc<Mutex<Option<PyRgbFrame>>>,
     latest_depth: Arc<Mutex<Option<PyDepthFrame>>>,
     latest_motion: Arc<Mutex<Option<PyMotionFrame>>>,
-    frame_count: Arc<Mutex<u64>>,
-    running: Arc<Mutex<bool>>,
+    frame_count: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
+    processing_stats: Arc<ProcessingStats>,
     depth_intrinsics: Option<PyIntrinsics>,
     color_intrinsics: Option<PyIntrinsics>,
     extrinsics: Option<PyExtrinsics>,
@@ -206,8 +259,9 @@ impl ZenohD435iSubscriber {
             latest_rgb: Arc::new(Mutex::new(None)),
             latest_depth: Arc::new(Mutex::new(None)),
             latest_motion: Arc::new(Mutex::new(None)),
-            frame_count: Arc::new(Mutex::new(0)),
-            running: Arc::new(Mutex::new(false)),
+            frame_count: Arc::new(AtomicU64::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            processing_stats: Arc::new(ProcessingStats::new()),
             depth_intrinsics: None,
             color_intrinsics: None,
             extrinsics: None,
@@ -237,7 +291,7 @@ impl ZenohD435iSubscriber {
         self.extrinsics = Some(extrinsics);
     }
     
-    /// Start subscribing to Zenoh topics
+    /// Start subscribing to Zenoh topics with optimized processing
     fn start_subscribing(&mut self) -> PyResult<()> {
         let session = self.session.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected to Zenoh. Call connect() first."))?
@@ -248,72 +302,118 @@ impl ZenohD435iSubscriber {
         let latest_motion = self.latest_motion.clone();
         let frame_count = self.frame_count.clone();
         let running = self.running.clone();
+        let processing_stats = self.processing_stats.clone();
         
-        *running.lock().unwrap() = true;
+        running.store(true, Ordering::Relaxed);
         
         let runtime = self.runtime.clone();
         
-        // Spawn the subscriber tasks
+        // Spawn the optimized subscriber tasks
         runtime.spawn(async move {
             let combined_subscriber = session.declare_subscriber("camera/combined").await.unwrap();
             let motion_subscriber = session.declare_subscriber("camera/motion").await.unwrap();
             
-            // Combined frame task
+            // Combined frame task with frame dropping and async processing
             let running_combined = running.clone();
             let rgb_store = latest_rgb.clone();
             let depth_store = latest_depth.clone();
             let frame_counter = frame_count.clone();
+            let stats = processing_stats.clone();
+            
             let combined_task = tokio::spawn(async move {
                 let mut last_print_time = Instant::now();
                 let mut local_frame_count = 0u32;
+                let mut pending_frames = 0usize;
                 const FPS_PRINT_INTERVAL: Duration = Duration::from_secs(5);
                 
-                println!("Combined frame subscriber started, listening on 'camera/combined'");
+                println!("Optimized combined frame subscriber started, listening on 'camera/combined'");
                 
-                while *running_combined.lock().unwrap() {
+                while running_combined.load(Ordering::Relaxed) {
                     match combined_subscriber.recv_async().await {
                         Ok(sample) => {
-                            let payload = sample.payload().to_bytes().to_vec();
-                            let combined_frame = CombinedFrameWire::decode(&payload);
+                            stats.frames_received.fetch_add(1, Ordering::Relaxed);
                             
-                            if let Some((rgb_raw, depth_raw, width, height, timestamp)) = unpack_combined_frame(&combined_frame) {
-                                // Create frames
-                                let rgb_frame = PyRgbFrame {
-                                    data: rgb_raw,
-                                    timestamp,
-                                    width,
-                                    height,
-                                };
+                            // Frame dropping logic - if we're behind, drop frames
+                            if pending_frames >= MAX_QUEUED_FRAMES {
+                                stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            
+                            let payload = sample.payload().to_bytes().to_vec();
+                            pending_frames += 1;
+                            stats.processing_queue_len.store(pending_frames as u64, Ordering::Relaxed);
+                            
+                            // Move heavy processing to blocking thread pool
+                            let rgb_store_clone = rgb_store.clone();
+                            let depth_store_clone = depth_store.clone();
+                            let frame_counter_clone = frame_counter.clone();
+                            let stats_clone = stats.clone();
+                            
+                            tokio::task::spawn_blocking(move || {
+                                let process_start = Instant::now();
                                 
-                                let depth_frame = PyDepthFrame {
-                                    width: width as usize,
-                                    height: height as usize,
-                                    timestamp,
-                                    data: depth_raw.iter().map(|&code| decode_u16_to_meters(code)).collect(),
-                                };
+                                // Decode frame in blocking context
+                                let combined_frame = CombinedFrameWire::decode(&payload);
                                 
-                                // Store latest frames
-                                if let Ok(mut rgb_lock) = rgb_store.lock() {
-                                    *rgb_lock = Some(rgb_frame);
+                                if let Some((rgb_raw, depth_raw, width, height, timestamp)) = unpack_combined_frame(&combined_frame) {
+                                    // Check processing timeout
+                                    if process_start.elapsed().as_millis() > PROCESSING_TIMEOUT_MS as u128 {
+                                        println!("Warning: Frame processing exceeded timeout");
+                                        return;
+                                    }
+                                    
+                                    // Create frames
+                                    let rgb_frame = PyRgbFrame {
+                                        data: rgb_raw,
+                                        timestamp,
+                                        width,
+                                        height,
+                                    };
+                                    
+                                    // Use lazy depth conversion
+                                    let depth_frame = PyDepthFrame::new(
+                                        depth_raw, 
+                                        timestamp, 
+                                        width as usize, 
+                                        height as usize
+                                    );
+                                    
+                                    // Update stores with combined lock to reduce contention
+                                    let mut frames_updated = false;
+                                    if let (Ok(mut rgb_lock), Ok(mut depth_lock)) = 
+                                        (rgb_store_clone.try_lock(), depth_store_clone.try_lock()) {
+                                        *rgb_lock = Some(rgb_frame);
+                                        *depth_lock = Some(depth_frame);
+                                        frames_updated = true;
+                                    }
+                                    
+                                    if frames_updated {
+                                        frame_counter_clone.fetch_add(1, Ordering::Relaxed);
+                                        stats_clone.frames_processed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                } else {
+                                    println!("Failed to unpack combined frame");
                                 }
-                                if let Ok(mut depth_lock) = depth_store.lock() {
-                                    *depth_lock = Some(depth_frame);
-                                }
-                                if let Ok(mut count_lock) = frame_counter.lock() {
-                                    *count_lock += 1;
-                                }
+                            });
+                            
+                            pending_frames = pending_frames.saturating_sub(1);
+                            
+                            // Update FPS counter
+                            local_frame_count += 1;
+                            if last_print_time.elapsed() >= FPS_PRINT_INTERVAL {
+                                let elapsed_secs = last_print_time.elapsed().as_secs_f32();
+                                let fps = local_frame_count as f32 / elapsed_secs;
+                                let total_received = stats.frames_received.load(Ordering::Relaxed);
+                                let total_dropped = stats.frames_dropped.load(Ordering::Relaxed);
+                                let total_processed = stats.frames_processed.load(Ordering::Relaxed);
                                 
-                                // Update FPS counter
-                                local_frame_count += 1;
-                                if last_print_time.elapsed() >= FPS_PRINT_INTERVAL {
-                                    let elapsed_secs = last_print_time.elapsed().as_secs_f32();
-                                    let fps = local_frame_count as f32 / elapsed_secs;
-                                    println!("Combined frame FPS: {:.2}", fps);
-                                    local_frame_count = 0;
-                                    last_print_time = Instant::now();
-                                }
-                            } else {
-                                println!("Failed to unpack combined frame");
+                                println!(
+                                    "Combined frame FPS: {:.2} | Received: {} | Processed: {} | Dropped: {} ({:.1}%)",
+                                    fps, total_received, total_processed, total_dropped,
+                                    if total_received > 0 { (total_dropped as f32 / total_received as f32) * 100.0 } else { 0.0 }
+                                );
+                                local_frame_count = 0;
+                                last_print_time = Instant::now();
                             }
                         }
                         Err(e) => {
@@ -322,19 +422,21 @@ impl ZenohD435iSubscriber {
                         }
                     }
                 }
-                println!("Combined frame subscriber stopped");
+                println!("Optimized combined frame subscriber stopped");
             });
             
-            // Motion task
+            // Motion task (unchanged as it's already lightweight)
             let running_motion = running.clone();
             let motion_store = latest_motion.clone();
             let motion_task = tokio::spawn(async move {
                 println!("Motion subscriber started, listening on 'camera/motion'");
                 
-                while *running_motion.lock().unwrap() {
+                while running_motion.load(Ordering::Relaxed) {
                     match motion_subscriber.recv_async().await {
                         Ok(sample) => {
                             let payload = sample.payload().to_bytes().to_vec();
+                            
+                            // Motion processing is lightweight, keep it in async context
                             let motion_frame = MotionFrameData::decodeAndDecompress(payload);
                             
                             let py_motion = PyMotionFrame {
@@ -344,7 +446,7 @@ impl ZenohD435iSubscriber {
                             };
                             
                             // Store latest motion data
-                            if let Ok(mut motion_lock) = motion_store.lock() {
+                            if let Ok(mut motion_lock) = motion_store.try_lock() {
                                 *motion_lock = Some(py_motion);
                             }
                         }
@@ -364,31 +466,27 @@ impl ZenohD435iSubscriber {
         Ok(())
     }
     
-    /// Get the latest frame data (non-blocking)
+    /// Get the latest frame data (non-blocking with try_lock)
     fn get_latest_frames(&self) -> PyFrameData {
-        let rgb = if let Ok(rgb_lock) = self.latest_rgb.lock() {
+        let rgb = if let Ok(rgb_lock) = self.latest_rgb.try_lock() {
             rgb_lock.clone()
         } else {
             None
         };
         
-        let depth = if let Ok(depth_lock) = self.latest_depth.lock() {
+        let depth = if let Ok(depth_lock) = self.latest_depth.try_lock() {
             depth_lock.clone()
         } else {
             None
         };
         
-        let motion = if let Ok(motion_lock) = self.latest_motion.lock() {
+        let motion = if let Ok(motion_lock) = self.latest_motion.try_lock() {
             motion_lock.clone()
         } else {
             None
         };
         
-        let frame_count = if let Ok(count_lock) = self.frame_count.lock() {
-            *count_lock
-        } else {
-            0
-        };
+        let frame_count = self.frame_count.load(Ordering::Relaxed);
         
         PyFrameData {
             rgb,
@@ -400,52 +498,64 @@ impl ZenohD435iSubscriber {
     
     /// Check if any new data is available
     fn has_new_data(&self) -> bool {
-        let frame_count = if let Ok(count_lock) = self.frame_count.lock() {
-            *count_lock
-        } else {
-            0
-        };
-        frame_count > 0
+        self.frame_count.load(Ordering::Relaxed) > 0
     }
     
-    /// Get frame statistics
+    /// Get frame statistics including latency metrics
     fn get_stats(&self) -> String {
-        let frame_count = if let Ok(count_lock) = self.frame_count.lock() {
-            *count_lock
-        } else {
-            0
-        };
+        let frame_count = self.frame_count.load(Ordering::Relaxed);
+        let frames_received = self.processing_stats.frames_received.load(Ordering::Relaxed);
+        let frames_dropped = self.processing_stats.frames_dropped.load(Ordering::Relaxed);
+        let frames_processed = self.processing_stats.frames_processed.load(Ordering::Relaxed);
+        let queue_len = self.processing_stats.processing_queue_len.load(Ordering::Relaxed);
         
-        let has_rgb = if let Ok(rgb_lock) = self.latest_rgb.lock() {
+        let has_rgb = if let Ok(rgb_lock) = self.latest_rgb.try_lock() {
             rgb_lock.is_some()
         } else {
             false
         };
         
-        let has_depth = if let Ok(depth_lock) = self.latest_depth.lock() {
+        let has_depth = if let Ok(depth_lock) = self.latest_depth.try_lock() {
             depth_lock.is_some()
         } else {
             false
         };
         
-        let has_motion = if let Ok(motion_lock) = self.latest_motion.lock() {
+        let has_motion = if let Ok(motion_lock) = self.latest_motion.try_lock() {
             motion_lock.is_some()
         } else {
             false
         };
         
-        format!("Frames received: {}, RGB: {}, Depth: {}, Motion: {}", 
-                frame_count, has_rgb, has_depth, has_motion)
+        let drop_rate = if frames_received > 0 {
+            (frames_dropped as f32 / frames_received as f32) * 100.0
+        } else {
+            0.0
+        };
+        
+        format!(
+            "Frames: {} | Received: {} | Processed: {} | Dropped: {} ({:.1}%) | Queue: {} | RGB: {} | Depth: {} | Motion: {}", 
+            frame_count, frames_received, frames_processed, frames_dropped, drop_rate, queue_len, has_rgb, has_depth, has_motion
+        )
     }
     
     /// Stop subscribing
     fn stop(&mut self) {
-        *self.running.lock().unwrap() = false;
+        self.running.store(false, Ordering::Relaxed);
     }
     
     /// Check if currently running
     fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
+        self.running.load(Ordering::Relaxed)
+    }
+    
+    /// Reset statistics
+    fn reset_stats(&self) {
+        self.processing_stats.frames_received.store(0, Ordering::Relaxed);
+        self.processing_stats.frames_dropped.store(0, Ordering::Relaxed);
+        self.processing_stats.frames_processed.store(0, Ordering::Relaxed);
+        self.processing_stats.processing_queue_len.store(0, Ordering::Relaxed);
+        self.frame_count.store(0, Ordering::Relaxed);
     }
 }
 
