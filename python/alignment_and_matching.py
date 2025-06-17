@@ -4,14 +4,24 @@ Zenoh RealSense D435i subscriber with live Rerun visualisation.
 
 * Uses *only* the unified rr.log(path, object) API (§ "Entity Path Hierarchy").
 * Streams RGB, depth, 3-D matches, match-lines, and SE(3) frame pose.
+
+Now supports recording and playback:
+- Live mode (default): python alignment_and_matching.py
+- Recording mode: python alignment_and_matching.py --record
+- Playback mode: python alignment_and_matching.py --playback recordings/camera_data_20231201_120000.pkl.gz
 """
 from __future__ import annotations
 
 import time
 import cv2
 import numpy as np
-import zenoh_d435i_subscriber as zd435i
+import sys
+import os
 
+# Add current directory to path for local imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from camera_data_manager import setup_camera_manager
 from camera_config import CameraCalibration
 from vision_utils import CAMERA_TO_ROBOT_FRAME, estimate_frame_transform
 from visualization import RerunVisualizer
@@ -21,14 +31,21 @@ from profiling import profiler
 def main() -> None:
     """Main application loop for RGB-D feature tracking and visualization."""
     
+    # Set up camera manager with command line arguments
+    camera_manager, args = setup_camera_manager("RGB-D feature tracking and pose estimation with recording/playback support")
+    
     # Initialize components
-    visualizer = RerunVisualizer("zenoh_d435i_live", spawn=True)
+    mode_str = camera_manager.get_mode()
+    visualizer = RerunVisualizer(f"zenoh_d435i_{mode_str}", spawn=True)
     camera_cal = CameraCalibration.create_default_d435i()
     
-    # Setup Zenoh subscriber
-    sub = zd435i.ZenohD435iSubscriber()
-    sub.connect()
-    sub.start_subscribing()
+    # Connect and start
+    try:
+        camera_manager.connect()
+        camera_manager.start_subscribing()
+    except Exception as e:
+        print(f"Error starting camera manager: {e}")
+        return
 
     last_frame = None
     frame_id = 0
@@ -60,12 +77,12 @@ def main() -> None:
     MAX_TRAJECTORY_LENGTH = 500  # Limit trajectory length for performance
 
     try:
-        while sub.is_running():
+        while camera_manager.is_running():
             frame_start = time.perf_counter()
             
             # Get latest frame data with minimal sleep
             with profiler.timer("frame_acquisition"):
-                fd = sub.get_latest_frames()
+                fd = camera_manager.get_latest_frames()
                 if fd.frame_count == 0:
                     time.sleep(MIN_SLEEP_TIME)
                     continue
@@ -187,7 +204,8 @@ def main() -> None:
                     avg_frame_time = sum(frame_times) / len(frame_times)
                     fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
                     max_frame_time = max(frame_times)
-                    print(f"Performance: {fps:.1f} FPS (avg: {avg_frame_time*1000:.1f}ms, max: {max_frame_time*1000:.1f}ms)")
+                    mode_prefix = camera_manager.get_status_string()
+                    print(f"{mode_prefix} Performance: {fps:.1f} FPS (avg: {avg_frame_time*1000:.1f}ms, max: {max_frame_time*1000:.1f}ms)")
                     
                     # Reset for next period
                     frame_times = []
@@ -199,14 +217,14 @@ def main() -> None:
                 time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print(f"\nShutting down {mode_str} mode...")
         
         # Print final profiling results
-        print("\nFinal Performance Analysis:")
+        print("\nDetailed Performance Analysis:")
         profiler.print_results(min_calls=1)
         
     finally:
-        sub.stop()
+        camera_manager.stop()
 
 
 if __name__ == "__main__":

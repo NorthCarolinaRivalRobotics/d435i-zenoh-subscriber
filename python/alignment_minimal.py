@@ -2,14 +2,24 @@
 """
 Minimal latency test - just RGB/depth visualization, no feature matching.
 This will help isolate if the latency is in Rust decompression or Python processing.
+
+Now supports recording and playback:
+- Live mode (default): python alignment_minimal.py
+- Recording mode: python alignment_minimal.py --record
+- Playback mode: python alignment_minimal.py --playback recordings/camera_data_20231201_120000.pkl.gz
 """
 from __future__ import annotations
 
 import time
 import cv2
 import numpy as np
-import zenoh_d435i_subscriber as zd435i
+import sys
+import os
 
+# Add current directory to path for local imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from camera_data_manager import setup_camera_manager
 from visualization import RerunVisualizer
 from profiling import profiler
 
@@ -17,16 +27,22 @@ from profiling import profiler
 def main() -> None:
     """Minimal loop to test latency without feature matching."""
     
-    print("Starting MINIMAL latency test...")
+    # Set up camera manager with command line arguments
+    camera_manager, args = setup_camera_manager("Minimal latency test with recording/playback support")
+    
     print("No feature matching - just RGB/depth visualization")
     
     # Initialize components
-    visualizer = RerunVisualizer("minimal_test", spawn=True)
+    mode_str = camera_manager.get_mode()
+    visualizer = RerunVisualizer(f"minimal_test_{mode_str}", spawn=True)
     
-    # Setup Zenoh subscriber
-    sub = zd435i.ZenohD435iSubscriber()
-    sub.connect()
-    sub.start_subscribing()
+    # Connect and start
+    try:
+        camera_manager.connect()
+        camera_manager.start_subscribing()
+    except Exception as e:
+        print(f"Error starting camera manager: {e}")
+        return
 
     frame_count = 0
     last_frame_id = -1
@@ -39,12 +55,12 @@ def main() -> None:
     last_stats_time = time.time()
 
     try:
-        while sub.is_running():
+        while camera_manager.is_running():
             loop_start = time.perf_counter()
             
-            # Measure Rust frame acquisition
+            # Measure frame acquisition time
             rust_start = time.perf_counter()
-            fd = sub.get_latest_frames()
+            fd = camera_manager.get_latest_frames()
             rust_time = time.perf_counter() - rust_start
             rust_times.append(rust_time)
             
@@ -106,12 +122,13 @@ def main() -> None:
                     avg_vis = sum(vis_times) / len(vis_times) * 1000
                     fps = len(frame_times) / 5.0
                     
-                    print(f"FPS: {fps:.1f} | Total: {avg_total:.1f}ms | "
-                          f"Rust: {avg_rust:.1f}ms | Decode: {avg_decode:.1f}ms | "
+                    mode_prefix = camera_manager.get_status_string()
+                    print(f"{mode_prefix} FPS: {fps:.1f} | Total: {avg_total:.1f}ms | "
+                          f"Data: {avg_rust:.1f}ms | Decode: {avg_decode:.1f}ms | "
                           f"Vis: {avg_vis:.1f}ms")
                     
                     # Show percentages
-                    print(f"  Breakdown: Rust {(avg_rust/avg_total)*100:.1f}%, "
+                    print(f"  Breakdown: Data {(avg_rust/avg_total)*100:.1f}%, "
                           f"Decode {(avg_decode/avg_total)*100:.1f}%, "
                           f"Vis {(avg_vis/avg_total)*100:.1f}%")
                     
@@ -123,14 +140,14 @@ def main() -> None:
                     last_stats_time = current_time
 
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print(f"\nShutting down {mode_str} mode...")
         
         # Print final profiling results
         print("\nDetailed Performance Analysis:")
         profiler.print_results(min_calls=1)
         
     finally:
-        sub.stop()
+        camera_manager.stop()
 
 
 if __name__ == "__main__":
