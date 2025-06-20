@@ -8,7 +8,9 @@ Zenoh RealSense D435i subscriber with live Rerun visualisation.
 Now supports recording and playback:
 - Live mode (default): python alignment_and_matching.py
 - Recording mode: python alignment_and_matching.py --record
-- Playback mode: python alignment_and_matching.py --playback recordings/camera_data_20231201_120000.pkl.gz
+- Playbook mode: python alignment_and_matching.py --playback recordings/camera_data_20231201_120000.pkl.gz
+
+Features multi-frame RGB-D odometry with N-frame feature tracking for noise reduction.
 """
 from __future__ import annotations
 
@@ -17,22 +19,23 @@ import cv2
 import numpy as np
 import sys
 import os
+from collections import deque
 
 # Add current directory to path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from camera_data_manager import setup_camera_manager
 from camera_config import CameraCalibration
-from vision_utils import CAMERA_TO_ROBOT_FRAME, estimate_frame_transform
+from vision_utils import CAMERA_TO_ROBOT_FRAME, estimate_multiframe_transform
 from visualization import RerunVisualizer
 from profiling import profiler
 
 
 def main() -> None:
-    """Main application loop for RGB-D feature tracking and visualization."""
+    """Main application loop for multi-frame RGB-D feature tracking and visualization."""
     
     # Set up camera manager with command line arguments
-    camera_manager, args = setup_camera_manager("RGB-D feature tracking and pose estimation with recording/playback support")
+    camera_manager, args = setup_camera_manager("Multi-frame RGB-D feature tracking and pose estimation with recording/playback support")
     
     # Initialize components
     mode_str = camera_manager.get_mode()
@@ -47,12 +50,14 @@ def main() -> None:
         print(f"Error starting camera manager: {e}")
         return
 
-    last_frame = None
+    # Multi-frame tracking parameters
+    N_FRAMES = 4  # Number of frames to track features across
+    frame_buffer = deque(maxlen=N_FRAMES)  # Store last N frames
     frame_id = 0
     
     # Performance optimization parameters
-    FEATURE_MATCHING_INTERVAL = 3  # Only do feature matching every N frames
-    MAX_PROCESSING_TIME = 0.030    # Target 30ms max processing time per frame
+    FEATURE_MATCHING_INTERVAL = 2  # Only do feature matching every N frames (reduced since we're doing more work)
+    MAX_PROCESSING_TIME = 0.050    # Increased target time due to multi-frame processing
     MIN_SLEEP_TIME = 0.001         # Minimum sleep time (1ms)
     
     # Statistics
@@ -86,8 +91,9 @@ def main() -> None:
                 if fd.frame_count == 0:
                     time.sleep(MIN_SLEEP_TIME)
                     continue
-                if last_frame is not None and fd.frame_count == last_frame["id"]:
-                    time.sleep(MIN_SLEEP_TIME)  # Reduced from 0.02
+                # Check if we have a new frame (compared to the most recent frame in buffer)
+                if len(frame_buffer) > 0 and fd.frame_count == frame_buffer[-1]["id"]:
+                    time.sleep(MIN_SLEEP_TIME)
                     continue
 
             # Process frame data
@@ -108,64 +114,70 @@ def main() -> None:
                     time.sleep(MIN_SLEEP_TIME)
                     continue
 
+            # Add current frame to buffer
+            current_frame = {
+                "rgb": rgb_img,
+                "depth": depth_img,
+                "id": fd.frame_count
+            }
+            frame_buffer.append(current_frame)
+
             # Log basic frame data (this should be fast)
             with profiler.timer("visualization_basic"):
                 visualizer.log_rgb_image(rgb_img)
                 visualizer.log_depth_image(depth_img, meter=1.0)
 
-            # Perform feature matching only occasionally to reduce latency
+            # Perform multi-frame feature matching only when we have enough frames and at intervals
             do_feature_matching = (
-                last_frame is not None and 
+                len(frame_buffer) >= N_FRAMES and 
                 frame_id % FEATURE_MATCHING_INTERVAL == 0
             )
             
             if do_feature_matching:
-                with profiler.timer("feature_matching_full"):
-                    P1, P2, T = estimate_frame_transform(
-                        last_frame["rgb"], last_frame["depth"], 
-                        rgb_img, depth_img,
+                with profiler.timer("multiframe_matching_full"):
+                    # Prepare frame data for multi-frame tracking
+                    frames_data = [(frame["rgb"], frame["depth"]) for frame in frame_buffer]
+                    
+                    print(f"\n=== Multi-frame tracking across {len(frames_data)} frames ===")
+                    P1, P2, T, num_tracks = estimate_multiframe_transform(
+                        frames_data,
                         camera_cal.K_rgb, camera_cal.K_depth, 
                         camera_cal.T_rgb_to_depth, 
-                        depth_scale=1.0  # Depth data is already in meters from decode_u16_to_meters()
+                        depth_scale=1.0  # Depth data is already in meters
                     )
 
-                    # print(f"Transform: {T}")
-
-                    # Log feature matches
-                    if len(P1) > 0:
+                    # Log feature matches if we have valid tracking results
+                    if len(P1) > 0 and len(P2) > 0:
                         with profiler.timer("visualization_matches"):
                             visualizer.log_3d_matches(P1, P2)
+                            print(f"Visualized {len(P1)} tracked feature matches")
 
-                    # Log camera pose
+                    # Log camera pose if transform is valid
                     if T is not None:
                         with profiler.timer("visualization_pose"):
                             # Log the relative transform using the original method
                             visualizer.log_camera_pose(T, frame_id)
                             
                             # Debug: Print individual transform components
-                            print(f"Raw pose T translation: {T[:3, 3]}")
-                            print(f"Raw pose T scale (det): {np.linalg.det(T[:3, :3]):.6f}")
+                            print(f"Multi-frame transform T translation: {T[:3, 3]}")
+                            print(f"Multi-frame transform scale (det): {np.linalg.det(T[:3, :3]):.6f}")
+                            print(f"Number of tracked features: {num_tracks}")
                             
                             # Apply coordinate transform
                             T_robot = CAMERA_TO_ROBOT_FRAME @ T
                             print(f"Robot frame translation: {T_robot[:3, 3]}")
-                            print(f"Robot frame scale (det): {np.linalg.det(T_robot[:3, :3]):.6f}")
                             
-                            # Accumulate
+                            # Accumulate the transform (this is now the transform over N_FRAMES instead of 1 frame)
                             T_Accumulated_Camera = T_Accumulated_Camera @ T
-                            print(f"Accumulated Transform in Camera Coordinates:\n {T_Accumulated_Camera}")
-                            print(f"Accumulated position: {T_Accumulated_Camera[:3, 3]}")
+                            print(f"Accumulated position (camera): {T_Accumulated_Camera[:3, 3]}")
                             print(f"Position breakdown - X(fwd): {T_Accumulated_Camera[0,3]:.3f}, Y(left): {T_Accumulated_Camera[1,3]:.3f}, Z(up): {T_Accumulated_Camera[2,3]:.3f}")
                             print(f"Total distance moved: {np.linalg.norm(T_Accumulated_Camera[:3, 3]):.3f}m")
-                            print("---")
 
                             # Transform to robot frame
                             T_Accumulated = CAMERA_TO_ROBOT_FRAME @ T_Accumulated_Camera
-                            print(f"Accumulated Transform in Robot Frame:\n {T_Accumulated}")
-                            print(f"Accumulated position: {T_Accumulated[:3, 3]}")
-                            print(f"Position breakdown - X(fwd): {T_Accumulated[0,3]:.3f}, Y(left): {T_Accumulated[1,3]:.3f}, Z(up): {T_Accumulated[2,3]:.3f}")
-                            print(f"Total distance moved: {np.linalg.norm(T_Accumulated[:3, 3]):.3f}m")
-                            print("---")
+                            print(f"Accumulated position (robot): {T_Accumulated[:3, 3]}")
+                            print(f"Robot frame - X(fwd): {T_Accumulated[0,3]:.3f}, Y(left): {T_Accumulated[1,3]:.3f}, Z(up): {T_Accumulated[2,3]:.3f}")
+                            print("=" * 50)
                             
                             # Add current position to trajectory
                             current_position = T_Accumulated_Camera[:3, 3]
@@ -187,9 +199,9 @@ def main() -> None:
                             # Log the trajectory trail
                             if len(camera_trajectory) > 1:
                                 visualizer.log_camera_trajectory(camera_trajectory)
+                    else:
+                        print(f"Multi-frame tracking failed - insufficient features (tracks: {num_tracks})")
 
-            # Update state for next iteration
-            last_frame = {"rgb": rgb_img, "depth": depth_img, "id": fd.frame_count}
             frame_id += 1
             
             # Track performance
@@ -205,7 +217,7 @@ def main() -> None:
                     fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
                     max_frame_time = max(frame_times)
                     mode_prefix = camera_manager.get_status_string()
-                    print(f"{mode_prefix} Performance: {fps:.1f} FPS (avg: {avg_frame_time*1000:.1f}ms, max: {max_frame_time*1000:.1f}ms)")
+                    print(f"{mode_prefix} Multi-frame Performance: {fps:.1f} FPS (avg: {avg_frame_time*1000:.1f}ms, max: {max_frame_time*1000:.1f}ms)")
                     
                     # Reset for next period
                     frame_times = []

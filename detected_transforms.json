@@ -1,0 +1,61 @@
+{
+  "accel_transform": [
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "analysis": {
+    "axis_mapping": {
+      "2": 1,
+      "0": 0
+    },
+    "sign_corrections": {
+      "2": 1.0,
+      "0": 1.0
+    },
+    "confidence_scores": [
+      0.4408451938284852,
+      0.0,
+      0.5969713243874929
+    ],
+    "correlations": [
+      [
+        0.4408451938284852,
+        0.07568733913397446,
+        0.0
+      ],
+      [
+        0.022090577511116694,
+        0.1936264452297923,
+        0.0
+      ],
+      [
+        0.03565074790187857,
+        0.5969713243874929,
+        0.0
+      ]
+    ]
+  },
+  "test_results": {
+    "avg_rp_difference": 59.92956043064068,
+    "reference_rp_difference": 59.92956043064068,
+    "improvement_degrees": 0.0,
+    "improvement_percentage": 0.0,
+    "avg_accel_usage": 0.0,
+    "samples_tested": 390
+  },
+  "timestamp": 1750218443.079773,
+  "method": "angular_rate_correlation"
+}
