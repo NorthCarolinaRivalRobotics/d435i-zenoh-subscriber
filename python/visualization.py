@@ -52,6 +52,55 @@ class RerunVisualizer:
             line_strips = [[p, q] for p, q in zip(points_prev, points_curr)]
             rr.log(path_lines, rr.LineStrips3D(line_strips))
     
+    def log_2d_feature_matches(self, keypoints_prev: list, keypoints_curr: list, 
+                              matches: list, rgb_prev: np.ndarray, rgb_curr: np.ndarray,
+                              path_prev: str = "feature_matches/frame_prev",
+                              path_curr: str = "feature_matches/frame_curr") -> None:
+        """Log 2D feature matches overlaid on RGB images."""
+        if len(matches) == 0:
+            return
+        
+        with profiler.timer("rerun_2d_matches_log"):
+            # Create images with matched features
+            import cv2
+            
+            # Convert keypoints to numpy arrays for the matched points
+            pts_prev = []
+            pts_curr = []
+            for match in matches:
+                pts_prev.append(keypoints_prev[match.queryIdx].pt)
+                pts_curr.append(keypoints_curr[match.trainIdx].pt)
+            
+            pts_prev = np.array(pts_prev)
+            pts_curr = np.array(pts_curr)
+            
+            # Draw matches on images
+            img_prev_with_matches = rgb_prev.copy()
+            img_curr_with_matches = rgb_curr.copy()
+            
+            # Draw circles at keypoint locations and lines between matches
+            for i, (pt1, pt2) in enumerate(zip(pts_prev, pts_curr)):
+                # Use color gradient based on match index
+                color = (int(255 * (1 - i/len(matches))), 
+                        int(255 * i/len(matches)), 
+                        0)
+                
+                # Draw keypoints
+                cv2.circle(img_prev_with_matches, tuple(map(int, pt1)), 4, color, -1)
+                cv2.circle(img_curr_with_matches, tuple(map(int, pt2)), 4, color, -1)
+            
+            # Log the images with matches
+            rr.log(path_prev, rr.Image(img_prev_with_matches))
+            rr.log(path_curr, rr.Image(img_curr_with_matches))
+            
+            # Also log just the 2D points as annotations
+            rr.log(f"{path_prev}/keypoints", rr.Points2D(pts_prev, 
+                                                         colors=[255, 0, 0],  # Red for previous frame
+                                                         radii=3))
+            rr.log(f"{path_curr}/keypoints", rr.Points2D(pts_curr, 
+                                                         colors=[0, 255, 0],  # Green for current frame
+                                                         radii=3))
+    
     def log_camera_pose(self, transform_matrix: np.ndarray, frame_id: int,
                        path_prefix: str = "frames") -> None:
         """Log camera pose as SE(3) transform to Rerun."""

@@ -10,7 +10,7 @@ import numpy as np
 import sys
 import os
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
 from collections import deque
 import threading
@@ -62,6 +62,11 @@ class VisualOdometryMeasurement(SensorMeasurement):
     num_inliers: int
     points_prev: np.ndarray  # 3D points in previous frame
     points_curr: np.ndarray  # 3D points in current frame
+    keypoints_prev: list = field(default_factory=list)  # Keypoints from first frame
+    keypoints_curr: list = field(default_factory=list)  # Keypoints from last frame  
+    matches: list = field(default_factory=list)  # Matches between frames
+    rgb_prev: np.ndarray = None  # RGB image from first frame (optional)
+    rgb_curr: np.ndarray = None  # RGB image from last frame (optional)
 
 
 class SensorInterface(ABC):
@@ -152,54 +157,56 @@ class IMUSensor(SensorInterface):
         
     def get_measurement(self) -> Optional[IMUMeasurement]:
         """Get calibrated IMU measurement."""
-        frame_data = self.subscriber.get_latest_frames()
-        
-        if frame_data.frame_count == 0 or frame_data.motion is None:
-            return None
+        with profiler.timer("IMU.get_measurement"):
+            frame_data = self.subscriber.get_latest_frames()
             
-        # Check if this is a new frame - crucial for avoiding duplicate processing!
-        if frame_data.frame_count == self.last_frame_count:
-            return None
+            if frame_data.frame_count == 0 or frame_data.motion is None:
+                return None
+                
+            # Check if this is a new frame - crucial for avoiding duplicate processing!
+            if frame_data.frame_count == self.last_frame_count:
+                return None
+                
+            # Update frame tracking
+            self.last_frame_count = frame_data.frame_count
+                
+            # Extract raw data
+            raw_gyro = np.array(frame_data.motion.gyro)
+            raw_accel = np.array(frame_data.motion.accel)
+            timestamp = frame_data.motion.timestamp
             
-        # Update frame tracking
-        self.last_frame_count = frame_data.frame_count
+            # Apply calibration
+            with profiler.timer("IMU.calibration"):
+                cal_gyro, cal_accel = self.processor.process_sample(raw_gyro, raw_accel)
             
-        # Extract raw data
-        raw_gyro = np.array(frame_data.motion.gyro)
-        raw_accel = np.array(frame_data.motion.accel)
-        timestamp = frame_data.motion.timestamp
-        
-        # Apply calibration
-        cal_gyro, cal_accel = self.processor.process_sample(raw_gyro, raw_accel)
-        
-        # Apply coordinate transform
-        cal_gyro = self.gyro_transform @ cal_gyro
-        cal_accel = self.gyro_transform @ cal_accel
-        
-        # Calculate dt with validation
-        dt = 0.01  # Default 10ms (100Hz)
-        if self.last_timestamp is not None:
-            calculated_dt = (timestamp - self.last_timestamp) / 1000.0  # ms to seconds
-            # Validate dt: must be positive and reasonable (between 1ms and 100ms)
-            if 0.001 <= calculated_dt <= 0.1:  
-                dt = calculated_dt
-            else:
-                # Log warning for debugging but continue with default dt
-                if calculated_dt <= 0:
-                    print(f"Warning: Invalid dt={calculated_dt:.6f}s (timestamp went backwards or same), using default")
+            # Apply coordinate transform
+            cal_gyro = self.gyro_transform @ cal_gyro
+            cal_accel = self.gyro_transform @ cal_accel
+            
+            # Calculate dt with validation
+            dt = 0.01  # Default 10ms (100Hz)
+            if self.last_timestamp is not None:
+                calculated_dt = (timestamp - self.last_timestamp) / 1000.0  # ms to seconds
+                # Validate dt: must be positive and reasonable (between 1ms and 100ms)
+                if 0.001 <= calculated_dt <= 0.1:  
+                    dt = calculated_dt
                 else:
-                    print(f"Warning: Unreasonable dt={calculated_dt:.3f}s, using default")
-        
-        self.last_timestamp = timestamp
-        self.frame_id += 1
-        
-        return IMUMeasurement(
-            timestamp=timestamp,
-            frame_id=self.frame_id,
-            gyro=cal_gyro,
-            accel=cal_accel,
-            dt=dt
-        )
+                    # Log warning for debugging but continue with default dt
+                    if calculated_dt <= 0:
+                        print(f"Warning: Invalid dt={calculated_dt:.6f}s (timestamp went backwards or same), using default")
+                    else:
+                        print(f"Warning: Unreasonable dt={calculated_dt:.3f}s, using default")
+            
+            self.last_timestamp = timestamp
+            self.frame_id += 1
+            
+            return IMUMeasurement(
+                timestamp=timestamp,
+                frame_id=self.frame_id,
+                gyro=cal_gyro,
+                accel=cal_accel,
+                dt=dt
+            )
     
     def is_ready(self) -> bool:
         """Check if IMU data is available."""
@@ -222,77 +229,122 @@ class VisualOdometrySensor(SensorInterface):
         
     def get_measurement(self) -> Optional[VisualOdometryMeasurement]:
         """Get visual odometry measurement from multi-frame tracking."""
-        fd = self.camera_manager.get_latest_frames()
-        
-        if fd.frame_count == 0:
-            return None
+        with profiler.timer("VO.get_measurement"):
+            fd = self.camera_manager.get_latest_frames()
             
-        # Check for new frame
-        if fd.frame_count == self.last_frame_id:
-            return None
-            
-        self.last_frame_id = fd.frame_count
-        
-        try:
-            # Decode images
-            rgb_buf = fd.rgb.get_data()
-            w, h = fd.rgb.width, fd.rgb.height
-            
-            import cv2
-            rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
-            if rgb_bgr is None:
-                rgb_bgr = np.frombuffer(rgb_buf, np.uint8).reshape((h, w, 3))
-            
-            rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-            depth_img = fd.depth.get_data_2d().astype(np.float32)
-            
-            # Add to buffer
-            self.frame_buffer.append({
-                "rgb": rgb_img,
-                "depth": depth_img,
-                "id": fd.frame_count,
-                "timestamp": time.time() * 1000  # Convert to ms
-            })
-            
-            # Need full buffer for multi-frame tracking
-            if len(self.frame_buffer) < self.n_frames:
+            if fd.frame_count == 0:
                 return None
                 
-            # Perform multi-frame tracking
-            frames_data = [(frame["rgb"], frame["depth"]) for frame in self.frame_buffer]
-            
-            P1, P2, T, num_tracks = estimate_multiframe_transform(
-                frames_data,
-                self.camera_cal.K_rgb, 
-                self.camera_cal.K_depth,
-                self.camera_cal.T_rgb_to_depth,
-                depth_scale=1.0
-            )
-            
-            if T is None or num_tracks < self.min_inliers:
+            # Check for new frame
+            if fd.frame_count == self.last_frame_id:
                 return None
                 
-            # Estimate covariance based on number of inliers and reprojection error
-            # Simple heuristic: fewer inliers = higher uncertainty
-            base_cov = np.eye(6) * 0.01  # Base covariance
-            cov_scale = max(1.0, 50.0 / num_tracks)  # Scale inversely with inliers
-            covariance = base_cov * cov_scale
+            self.last_frame_id = fd.frame_count
             
-            self.frame_id += 1
-            
-            return VisualOdometryMeasurement(
-                timestamp=self.frame_buffer[-1]["timestamp"],
-                frame_id=self.frame_id,
-                transform=T,
-                covariance=covariance,
-                num_inliers=num_tracks,
-                points_prev=P1,
-                points_curr=P2
-            )
-            
-        except Exception as e:
-            print(f"Error in visual odometry: {e}")
-            return None
+            try:
+                # Decode images
+                with profiler.timer("VO.decode_images"):
+                    rgb_buf = fd.rgb.get_data()
+                    w, h = fd.rgb.width, fd.rgb.height
+                    
+                    # Debug RGB buffer
+                    print(f"[DEBUG] RGB buffer: size={len(rgb_buf)} bytes, expected dimensions={w}x{h}")
+                    if len(rgb_buf) < 100:
+                        print(f"[DEBUG] RGB buffer too small! First 50 bytes: {rgb_buf[:50].hex() if rgb_buf else 'EMPTY'}")
+                    
+                    import cv2
+                    
+                    # Check if buffer is raw RGB based on size
+                    expected_raw_size = w * h * 3
+                    if len(rgb_buf) == expected_raw_size:
+                        # Raw RGB data
+                        rgb_bgr = np.frombuffer(rgb_buf, np.uint8).reshape((h, w, 3))
+                    else:
+                        # Try JPEG decode
+                        rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
+                        if rgb_bgr is None:
+                            print(f"[DEBUG] JPEG decode failed for buffer size {len(rgb_buf)}")
+                    
+                    depth_img = fd.depth.get_data_2d().astype(np.float32)
+                
+                # Add to buffer
+                timestamp = time.time() * 1000  # Convert to ms
+                # Convert BGR to RGB before storing
+                if rgb_bgr is not None:
+                    rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB) 
+                else:
+                    rgb_img = None
+                    
+                # Only add to buffer if we have valid RGB data
+                if rgb_img is not None:
+                    self.frame_buffer.append({
+                        "rgb": rgb_img,
+                        "depth": depth_img,
+                        "id": fd.frame_count,
+                        "timestamp": timestamp
+                    })
+                    
+                    # Debug: Log frame buffer status
+                    print(f"[VO DEBUG] Frame buffer: {len(self.frame_buffer)}/{self.n_frames} frames, "
+                          f"frame_id={fd.frame_count}, timestamp={timestamp:.1f}ms")
+                else:
+                    print(f"[VO DEBUG] Skipping frame {fd.frame_count} - no valid RGB data")
+                
+                # Need full buffer for multi-frame tracking
+                if len(self.frame_buffer) < self.n_frames:
+                    print(f"[VO DEBUG] Waiting for more frames... ({len(self.frame_buffer)}/{self.n_frames})")
+                    return None
+                    
+                # Perform multi-frame tracking
+                frames_data = [(frame["rgb"], frame["depth"]) for frame in self.frame_buffer]
+                print(f"Frames data: {len(frames_data)}")
+                
+                with profiler.timer("VO.estimate_transform"):
+                    result = estimate_multiframe_transform(
+                        frames_data,
+                        self.camera_cal.K_rgb, 
+                        self.camera_cal.K_depth,
+                        self.camera_cal.T_rgb_to_depth,
+                        depth_scale=1.0,
+                        return_keypoints_matches=True
+                    )
+                
+                # Unpack results based on return_keypoints_matches flag
+                if len(result) == 7:
+                    P1, P2, T, num_tracks, kp_prev, kp_curr, matches = result
+                else:
+                    P1, P2, T, num_tracks = result
+                    kp_prev, kp_curr, matches = [], [], []
+                
+                if T is None or num_tracks < self.min_inliers:
+                    return None
+                    
+                # Estimate covariance based on number of inliers and reprojection error
+                # Simple heuristic: fewer inliers = higher uncertainty
+                base_cov = np.eye(6) * 0.01  # Base covariance
+                cov_scale = max(1.0, 50.0 / num_tracks)  # Scale inversely with inliers
+                covariance = base_cov * cov_scale
+                
+                self.frame_id += 1
+                
+                return VisualOdometryMeasurement(
+                    timestamp=self.frame_buffer[-1]["timestamp"],
+                    frame_id=self.frame_id,
+                    transform=T,
+                    covariance=covariance,
+                    num_inliers=num_tracks,
+                    points_prev=P1,
+                    points_curr=P2,
+                    keypoints_prev=kp_prev,
+                    keypoints_curr=kp_curr,
+                    matches=matches,
+                    rgb_prev=self.frame_buffer[0]["rgb"],  # First frame
+                    rgb_curr=self.frame_buffer[-1]["rgb"]  # Last frame
+                )
+                
+            except Exception as e:
+                print(f"Error in visual odometry: {e}")
+                return None
     
     def is_ready(self) -> bool:
         """Check if enough frames are buffered."""
@@ -310,13 +362,14 @@ class FusionVisualizer(RerunVisualizer):
         
     def setup_fusion_layout(self):
         """Set up Rerun layout for fusion visualization."""
-        # Log static coordinate frames
-        self.log_coordinate_frame("world", scale=1.0)
-        self.log_coordinate_frame("imu", scale=0.3, color=[255, 0, 0])
-        self.log_coordinate_frame("camera", scale=0.3, color=[0, 255, 0])
+        # Log static coordinate frames with static=True to avoid re-logging
+        self.log_coordinate_frame("world", scale=1.0, static=True)
+        self.log_coordinate_frame("imu", scale=0.3, color=[255, 0, 0], static=True)
+        self.log_coordinate_frame("camera", scale=0.3, color=[0, 255, 0], static=True)
         
     def log_coordinate_frame(self, name: str, scale: float = 1.0, 
-                           color: list[int] = None, transform: np.ndarray = None):
+                           color: list[int] = None, transform: np.ndarray = None,
+                           static: bool = False):
         """Log a coordinate frame with axes."""
         origins = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
         vectors = [[scale, 0, 0], [0, scale, 0], [0, 0, scale]]
@@ -346,30 +399,39 @@ class FusionVisualizer(RerunVisualizer):
             vectors=vectors,
             colors=colors,
             labels=["X", "Y", "Z"]
-        ))
+        ), static=static)
     
     def log_imu_data(self, measurement: IMUMeasurement):
         """Log IMU measurement data."""
         import rerun as rr
         
-        rr.set_time_seconds("timestamp", measurement.timestamp / 1000.0)
+        # Don't set time here - it's set in main loop
+        # rr.set_time_seconds("timestamp", measurement.timestamp / 1000.0)
         
-        # Log raw values
-        rr.log("imu/gyro_x", rr.Scalar(measurement.gyro[0]))
-        rr.log("imu/gyro_y", rr.Scalar(measurement.gyro[1]))
-        rr.log("imu/gyro_z", rr.Scalar(measurement.gyro[2]))
-        rr.log("imu/gyro_magnitude", rr.Scalar(np.linalg.norm(measurement.gyro)))
+        # Initialize counter for reduced frequency logging
+        if not hasattr(self, '_imu_log_counter'):
+            self._imu_log_counter = 0
+        self._imu_log_counter += 1
         
-        rr.log("imu/accel_x", rr.Scalar(measurement.accel[0]))
-        rr.log("imu/accel_y", rr.Scalar(measurement.accel[1]))
-        rr.log("imu/accel_z", rr.Scalar(measurement.accel[2]))
-        rr.log("imu/accel_magnitude", rr.Scalar(np.linalg.norm(measurement.accel)))
-        
+        # Only log scalars every 5th IMU measurement to reduce load
+        if self._imu_log_counter % 5 == 0:
+            # Log raw values
+            rr.log("imu/gyro_x", rr.Scalar(measurement.gyro[0]))
+            rr.log("imu/gyro_y", rr.Scalar(measurement.gyro[1]))
+            rr.log("imu/gyro_z", rr.Scalar(measurement.gyro[2]))
+            rr.log("imu/gyro_magnitude", rr.Scalar(np.linalg.norm(measurement.gyro)))
+            
+            rr.log("imu/accel_x", rr.Scalar(measurement.accel[0]))
+            rr.log("imu/accel_y", rr.Scalar(measurement.accel[1]))
+            rr.log("imu/accel_z", rr.Scalar(measurement.accel[2]))
+            rr.log("imu/accel_magnitude", rr.Scalar(np.linalg.norm(measurement.accel)))
+    
     def log_visual_odometry_data(self, measurement: VisualOdometryMeasurement):
         """Log visual odometry measurement."""
         import rerun as rr
         
-        rr.set_time_seconds("timestamp", measurement.timestamp / 1000.0)
+        # Don't set time here - it's set in main loop
+        # rr.set_time_seconds("timestamp", measurement.timestamp / 1000.0)
         
         # Log transform components
         translation = measurement.transform[:3, 3]
@@ -385,6 +447,21 @@ class FusionVisualizer(RerunVisualizer):
         # Log 3D matches only if enabled
         if self.plot_3d_matches and len(measurement.points_prev) > 0:
             self.log_3d_matches(measurement.points_prev, measurement.points_curr)
+            
+        # Log 2D feature matches if available - reduce frequency
+        if not hasattr(self, '_vo_match_log_counter'):
+            self._vo_match_log_counter = 0
+        self._vo_match_log_counter += 1
+        
+        # Only log matches every 3rd frame to reduce load
+        if len(measurement.keypoints_prev) > 0 and len(measurement.keypoints_curr) > 0 and len(measurement.matches) > 0 and measurement.rgb_prev is not None and measurement.rgb_curr is not None:
+            self.log_2d_feature_matches(
+                measurement.keypoints_prev,
+                measurement.keypoints_curr,
+                measurement.matches,
+                measurement.rgb_prev,
+                measurement.rgb_curr
+            )
     
     def log_fusion_state(self, pose: Tuple[np.ndarray, np.ndarray], 
                         velocity: np.ndarray = None, bias: Dict = None):
@@ -396,8 +473,8 @@ class FusionVisualizer(RerunVisualizer):
         # Log fused position
         rr.log("fusion/position", rr.Points3D([position], colors=[255, 255, 0], radii=0.05))
         
-        # Log trajectory
-        rr.log("fusion/trajectory", rr.Points3D([position], colors=[255, 200, 0], radii=0.02))
+        # Don't log trajectory point here - we'll handle it in main loop
+        # rr.log("fusion/trajectory", rr.Points3D([position], colors=[255, 200, 0], radii=0.02))
         
         # Create transform from quaternion
         q = Quaternion.from_array(quaternion)
@@ -406,48 +483,45 @@ class FusionVisualizer(RerunVisualizer):
         T[:3, :3] = R
         T[:3, 3] = position
         
-        # Log coordinate frame at current pose (make it larger and more visible)
-        self.log_coordinate_frame("fusion/current", scale=1.0, color=[255, 255, 0], transform=T)
+        # Log coordinate frame only occasionally (removed to reduce overhead)
+        # self.log_coordinate_frame("fusion/current", scale=1.0, color=[255, 255, 0], transform=T)
         
-        # Add a prominent forward direction arrow
+        # Log a single orientation arrow instead of multiple
         forward_vector = R @ np.array([1.0, 0, 0])  # Forward is +X direction
-        rr.log("fusion/orientation_arrow", rr.Arrows3D(
+        rr.log("fusion/orientation", rr.Arrows3D(
             origins=[position],
             vectors=[forward_vector * 0.8],  # Scale the arrow
-            colors=[255, 0, 255],  # Magenta for visibility
-            labels=["Forward"],
+            colors=[255, 255, 0],  # Yellow for visibility
             radii=0.02
         ))
         
-        # Add orientation vectors for better visualization
-        up_vector = R @ np.array([0, 0, 1.0])  # Up is +Z direction
-        right_vector = R @ np.array([0, 1.0, 0])  # Right is +Y direction
+        # Remove redundant orientation vectors
+        # up_vector = R @ np.array([0, 0, 1.0])  # Up is +Z direction
+        # right_vector = R @ np.array([0, 1.0, 0])  # Right is +Y direction
         
-        rr.log("fusion/orientation_vectors", rr.Arrows3D(
-            origins=[position, position, position],
-            vectors=[forward_vector * 0.6, right_vector * 0.4, up_vector * 0.4],
-            colors=[255, 0, 0, 0, 255, 0, 0, 0, 255],  # Red, Green, Blue
-            labels=["Forward", "Right", "Up"],
-            radii=0.015
-        ))
+        # Log state values (reduce frequency of scalar logging)
+        # Only log every 10th call to reduce load
+        if not hasattr(self, '_scalar_log_counter'):
+            self._scalar_log_counter = 0
+        self._scalar_log_counter += 1
         
-        # Log state values
-        rr.log("fusion/position_x", rr.Scalar(position[0]))
-        rr.log("fusion/position_y", rr.Scalar(position[1]))
-        rr.log("fusion/position_z", rr.Scalar(position[2]))
-        
-        # Log orientation as Euler angles for easier interpretation
-        from scipy.spatial.transform import Rotation as scipy_R
-        euler = scipy_R.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]]).as_euler('xyz', degrees=True)
-        rr.log("fusion/roll_deg", rr.Scalar(euler[0]))
-        rr.log("fusion/pitch_deg", rr.Scalar(euler[1]))
-        rr.log("fusion/yaw_deg", rr.Scalar(euler[2]))
-        
-        # Log quaternion components
-        rr.log("fusion/quat_w", rr.Scalar(quaternion[0]))
-        rr.log("fusion/quat_x", rr.Scalar(quaternion[1]))
-        rr.log("fusion/quat_y", rr.Scalar(quaternion[2]))
-        rr.log("fusion/quat_z", rr.Scalar(quaternion[3]))
+        if self._scalar_log_counter % 10 == 0:
+            rr.log("fusion/position_x", rr.Scalar(position[0]))
+            rr.log("fusion/position_y", rr.Scalar(position[1]))
+            rr.log("fusion/position_z", rr.Scalar(position[2]))
+            
+            # Log orientation as Euler angles for easier interpretation
+            from scipy.spatial.transform import Rotation as scipy_R
+            euler = scipy_R.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]]).as_euler('xyz', degrees=True)
+            rr.log("fusion/roll_deg", rr.Scalar(euler[0]))
+            rr.log("fusion/pitch_deg", rr.Scalar(euler[1]))
+            rr.log("fusion/yaw_deg", rr.Scalar(euler[2]))
+            
+            # Log quaternion components
+            rr.log("fusion/quat_w", rr.Scalar(quaternion[0]))
+            rr.log("fusion/quat_x", rr.Scalar(quaternion[1]))
+            rr.log("fusion/quat_y", rr.Scalar(quaternion[2]))
+            rr.log("fusion/quat_z", rr.Scalar(quaternion[3]))
         
         if velocity is not None:
             rr.log("fusion/velocity_magnitude", rr.Scalar(np.linalg.norm(velocity)))
@@ -531,7 +605,7 @@ class FusionPoseEstimator:
             y_from='X',   # Robot Y ← Camera X
             z_from='Y',   # Robot Z ← Camera Y
             x_sign=-1,    # Negate X mapping (Camera -Z → Robot X)
-            z_sign=1      # No negation for Z mapping (Camera Y → Robot Z)
+            z_sign=-1      # No negation for Z mapping (Camera Y → Robot Z)
         )
         
         print("Gyro coordinate transform (Camera to Robot):")
@@ -545,79 +619,75 @@ class FusionPoseEstimator:
         self.camera_to_robot_transform = gyro_transform
         
         # Initialize visual odometry system
-        print("Starting camera manager...")
-        self.vo_system = VisualOdometrySensor(camera_manager, camera_cal, n_frames=4)
+        self.vo_system = VisualOdometrySensor(camera_manager, camera_cal, n_frames=3)
         
-        print("✓ Sensors ready")
         
     def sensor_data_thread(self):
         """Background thread to collect sensor data."""
         while self.running:
-            # Collect gyroscope data
-            gyro_measurement = self.gyro_sensor.get_gyro_measurement()
-            if gyro_measurement is not None:
-                with self.queue_lock:
-                    self.gyro_queue.append(gyro_measurement)
-                    self.stats['gyro_measurements'] += 1
-            
-            # Collect visual odometry data  
-            vo_measurement = self.vo_system.get_measurement()
-            if vo_measurement is not None:
-                # Extract translation and transform from camera to robot frame
-                translation_camera = vo_measurement.transform[:3, 3]
-                translation_robot = self.camera_to_robot_transform @ translation_camera
+            with profiler.timer("sensor_data_thread"):
+                # Collect gyroscope data
+                gyro_measurement = self.gyro_sensor.get_gyro_measurement()
+                if gyro_measurement is not None:
+                    with self.queue_lock:
+                        self.gyro_queue.append(gyro_measurement)
+                        self.stats['gyro_measurements'] += 1
                 
-                translation_data = {
-                    'translation': translation_robot,
-                    'covariance': np.diag(vo_measurement.covariance)[3:6],  # Translation part
-                    'timestamp': time.time()
-                }
+                # Collect visual odometry data  
+                vo_measurement = self.vo_system.get_measurement()
+                if vo_measurement is not None:
+                    # Extract translation and transform from camera to robot frame
+                    translation_camera = vo_measurement.transform[:3, 3]
+                    translation_robot = self.camera_to_robot_transform @ translation_camera
+                    
+                    translation_data = {
+                        'translation': translation_robot,
+                        'covariance': np.diag(vo_measurement.covariance)[3:6],  # Translation part
+                        'timestamp': time.time()
+                    }
+                    
+                    with self.queue_lock:
+                        self.translation_queue.append(translation_data)
+                        self.stats['translation_measurements'] += 1
                 
-                with self.queue_lock:
-                    self.translation_queue.append(translation_data)
-                    self.stats['translation_measurements'] += 1
-            
-            time.sleep(0.001)  # Small sleep to prevent busy waiting
+                time.sleep(0.001)  # Small sleep to prevent busy waiting
     
     def run_fusion_step(self):
         """Run one fusion step."""
-        # Process all available gyro measurements
-        gyro_measurements_processed = 0
-        with self.queue_lock:
-            while self.gyro_queue:
-                gyro_data = self.gyro_queue.popleft()
-                # Add debug output
-                gyro_magnitude = np.linalg.norm(gyro_data['gyro'])
-                if gyro_magnitude > 0.01:  # Only print for significant rotation
-                    print(f"Processing gyro: magnitude={gyro_magnitude:.4f} rad/s, timestamp={gyro_data['timestamp']}")
-                
-                # Integrate gyroscope data
-                self.backend.integrate_gyro(gyro_data['gyro'], gyro_data['timestamp'])
-                gyro_measurements_processed += 1
-        
-        # Process camera translation measurements
-        translation_processed = False
-        with self.queue_lock:
-            if self.translation_queue:
-                translation_data = self.translation_queue.popleft()
-                # Add debug output
-                trans_magnitude = np.linalg.norm(translation_data['translation'])
-                if trans_magnitude > 0.001:  # Only print for significant translations
-                    print(f"Processing translation: magnitude={trans_magnitude:.4f} m")
-                    print(f"  Robot frame: [{translation_data['translation'][0]:.4f}, "
-                          f"{translation_data['translation'][1]:.4f}, "
-                          f"{translation_data['translation'][2]:.4f}]")
-                
-                # Add camera translation measurement
-                success = self.backend.add_camera_translation(
-                    translation_data['translation'],
-                    translation_data['covariance']
-                )
-                if success:
-                    translation_processed = True
-                    self.stats['fusion_updates'] += 1
-        
-        return gyro_measurements_processed > 0 or translation_processed
+        with profiler.timer("fusion_step"):
+            # Process all available gyro measurements
+            gyro_measurements_processed = 0
+            with self.queue_lock:
+                while self.gyro_queue:
+                    gyro_data = self.gyro_queue.popleft()
+                    # Add debug output
+                    gyro_magnitude = np.linalg.norm(gyro_data['gyro'])
+                    if gyro_magnitude > 0.01:  # Only print for significant rotation
+                        print(f"Processing gyro: magnitude={gyro_magnitude:.4f} rad/s, timestamp={gyro_data['timestamp']}")
+                    
+                    # Integrate gyroscope data
+                    with profiler.timer("backend.integrate_gyro"):
+                        self.backend.integrate_gyro(gyro_data['gyro'], gyro_data['timestamp'])
+                    gyro_measurements_processed += 1
+            
+            # Process camera translation measurements
+            translation_processed = False
+            with self.queue_lock:
+                if self.translation_queue:
+                    translation_data = self.translation_queue.popleft()
+                    # Add debug output
+                    trans_magnitude = np.linalg.norm(translation_data['translation'])
+                    # Add camera translation measurement
+                    with profiler.timer("backend.add_camera_translation"):
+                        success = self.backend.add_camera_translation(
+                            translation_data['translation'],
+                            translation_data['covariance']
+                        )
+                    if success:
+                        translation_processed = True
+                        self.stats['fusion_updates'] += 1
+            
+            return gyro_measurements_processed > 0 or translation_processed
     
     def get_current_state(self):
         """Get current pose estimate."""
@@ -719,13 +789,20 @@ def main():
     print("✓ Set up coordinate transforms")
     
     # Initialize fusion system
-    fusion_estimator = FusionPoseEstimator(window_size=5)
+    fusion_estimator = FusionPoseEstimator(window_size=2)
     fusion_estimator.initialize_sensors(subscriber, camera_manager, camera_cal)
     
     # Wait for initial sensor data
     print("Waiting for sensor data...")
+    start_wait_time = time.time()
     while not (camera_manager.is_running()):
         time.sleep(0.1)
+        elapsed = time.time() - start_wait_time
+        if int(elapsed) % 1 == 0 and elapsed - int(elapsed) < 0.1:  # Print every second
+            print(f"  Still waiting for camera manager... ({elapsed:.1f}s)")
+    
+    print(f"Camera manager ready after {time.time() - start_wait_time:.1f}s")
+    print("Waiting additional 2 seconds for sensor stabilization...")
     time.sleep(2.0)
     print("✓ Sensors ready")
     print()
@@ -740,93 +817,174 @@ def main():
     try:
         last_report_time = time.time()
         trajectory_points = []
+        last_camera_frame_id = -1  # Track last logged camera frame
+        camera_frame_skip_counter = 0  # Skip some camera frames to reduce load
+        camera_frames_logged = 0  # Track how many frames we actually log
+        
+        # Frame rate tracking
+        frame_timestamps = deque(maxlen=30)  # Track last 30 frames for FPS calculation
+        last_fps_report = time.time()
         
         while True:
-            # Get current sensor measurements for visualization
-            gyro_measurement = fusion_estimator.gyro_sensor.get_gyro_measurement()
-            if gyro_measurement is not None:
-                # Convert to IMUMeasurement format for visualization
-                imu_meas = IMUMeasurement(
-                    timestamp=gyro_measurement['timestamp'],
-                    frame_id=gyro_measurement['frame_id'],
-                    gyro=gyro_measurement['gyro'],
-                    accel=np.zeros(3),  # We don't use accelerometer in this version
-                    dt=0.01
-                )
-                visualizer.log_imu_data(imu_meas)
-            
-            # Get visual odometry measurement for visualization
-            vo_measurement = fusion_estimator.vo_system.get_measurement()
-            if vo_measurement is not None:
-                visualizer.log_visual_odometry_data(vo_measurement)
-            
-            # Run fusion step
-            fusion_estimator.run_fusion_step()
-            
-            # Get current pose and log to visualizer
-            position, quaternion = fusion_estimator.get_current_state()
-            
-            # Log current fusion state
-            visualizer.log_fusion_state((position, quaternion))
-            
-            # Add to trajectory
-            trajectory_points.append(position.copy())
-            if len(trajectory_points) > 1000:  # Keep last 1000 points
-                trajectory_points.pop(0)
-            
-            # Log trajectory
-            if len(trajectory_points) > 1:
-                import rerun as rr
-                rr.log("trajectory", rr.LineStrips3D([trajectory_points], colors=[255, 255, 0]))
-            
-            # Log camera images when available
-            frame_data = camera_manager.get_latest_frames()
-            if frame_data.frame_count > 0:
-                try:
-                    # Log RGB image
-                    rgb_buf = frame_data.rgb.get_data()
-                    w, h = frame_data.rgb.width, frame_data.rgb.height
+            with profiler.timer("main_loop"):
+                # Set time ONCE at the beginning of each loop iteration
+                current_time = time.time()
+                rr.set_time_seconds("timestamp", current_time)
+                
+                # Get current sensor measurements for visualization
+                gyro_measurement = fusion_estimator.gyro_sensor.get_gyro_measurement()
+                if gyro_measurement is not None:
+                    # Convert to IMUMeasurement format for visualization
+                    imu_meas = IMUMeasurement(
+                        timestamp=gyro_measurement['timestamp'],
+                        frame_id=gyro_measurement['frame_id'],
+                        gyro=gyro_measurement['gyro'],
+                        accel=np.zeros(3),  # We don't use accelerometer in this version
+                        dt=0.01
+                    )
+                    with profiler.timer("visualizer.log_imu"):
+                        visualizer.log_imu_data(imu_meas)
+                
+                # Get visual odometry measurement for visualization
+                vo_measurement = fusion_estimator.vo_system.get_measurement()
+                if vo_measurement is not None:
+                    with profiler.timer("visualizer.log_vo"):
+                        visualizer.log_visual_odometry_data(vo_measurement)
+                
+                # Run fusion step
+                fusion_estimator.run_fusion_step()
+                
+                # Get current pose and log to visualizer
+                with profiler.timer("get_pose"):
+                    position, quaternion = fusion_estimator.get_current_state()
+                
+                # Log current fusion state
+                with profiler.timer("visualizer.log_fusion"):
+                    visualizer.log_fusion_state((position, quaternion))
+                
+                # Add to trajectory
+                trajectory_points.append(position.copy())
+                if len(trajectory_points) > 1000:  # Keep last 1000 points
+                    trajectory_points.pop(0)
+                
+                # Log trajectory less frequently to reduce load
+                # Initialize trajectory logging counter if not exists
+                if not hasattr(fusion_estimator, '_trajectory_log_counter'):
+                    fusion_estimator._trajectory_log_counter = 0
+                fusion_estimator._trajectory_log_counter += 1
+                
+                # Only log trajectory every 10 frames (10Hz if running at 100Hz)
+                if len(trajectory_points) > 1 and fusion_estimator._trajectory_log_counter % 10 == 0:
+                    with profiler.timer("visualizer.log_trajectory"):
+                        rr.log("trajectory", rr.LineStrips3D([trajectory_points], colors=[255, 255, 0]))
+                
+                # Log camera images when available
+                frame_data = camera_manager.get_latest_frames()
+                if frame_data.frame_count > 0 and frame_data.frame_count != last_camera_frame_id:
+                    # Debug: Log when we get a new camera frame
+                    print(f"[DEBUG] New camera frame: ID={frame_data.frame_count}, time={current_time:.6f}")
                     
-                    import cv2
-                    rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
-                    if rgb_bgr is not None:
-                        rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-                        rr.log("camera/rgb", rr.Image(rgb_img))
+                    # Track camera frame timestamps for FPS calculation
+                    frame_timestamps.append(current_time)
+                    if len(frame_timestamps) >= 2:
+                        # Calculate instantaneous FPS from last two frames
+                        instant_fps = 1.0 / (frame_timestamps[-1] - frame_timestamps[-2])
+                        # Calculate average FPS over all tracked frames
+                        if len(frame_timestamps) == frame_timestamps.maxlen:
+                            avg_fps = len(frame_timestamps) / (frame_timestamps[-1] - frame_timestamps[0])
+                            print(f"[DEBUG] Camera FPS: instant={instant_fps:.1f}, avg={avg_fps:.1f}")
+                        else:
+                            print(f"[DEBUG] Camera FPS: instant={instant_fps:.1f} (building average...)")
                     
-                    # Log depth image
-                    depth_img = frame_data.depth.get_data_2d().astype(np.float32)
-                    if depth_img is not None:
-                        rr.log("camera/depth", rr.DepthImage(depth_img, meter=1000.0))
-                        
-                except Exception as e:
-                    pass  # Continue if image logging fails
-            
-            # Report status every 5 seconds
-            current_time = time.time()
-            if current_time - last_report_time >= 5.0:
-                stats = fusion_estimator.get_statistics()
+                    camera_frame_skip_counter += 1
+                    # Only log every 2nd camera frame to reduce load (roughly 15 FPS if camera is 30 FPS)
+                    if camera_frame_skip_counter % 2 == 0:
+                        print(f"[DEBUG] Logging camera frame (skip_counter={camera_frame_skip_counter})")
+                        try:
+                            with profiler.timer("visualizer.log_images"):
+                                # Decode both images first
+                                rgb_buf = frame_data.rgb.get_data()
+                                w, h = frame_data.rgb.width, frame_data.rgb.height
+                                
+                                import cv2
+                                
+                                # Check if buffer is raw RGB based on size
+                                expected_raw_size = w * h * 3
+                                if len(rgb_buf) == expected_raw_size:
+                                    # Raw RGB data
+                                    rgb_bgr = np.frombuffer(rgb_buf, np.uint8).reshape((h, w, 3))
+                                else:
+                                    # Try JPEG decode
+                                    rgb_bgr = cv2.imdecode(np.frombuffer(rgb_buf, np.uint8), cv2.IMREAD_COLOR)
+                                    if rgb_bgr is None:
+                                        print(f"[DEBUG] JPEG decode failed for buffer size {len(rgb_buf)}")
+                                
+                                depth_img = frame_data.depth.get_data_2d().astype(np.float32)
+                                
+                                # Only log if BOTH images are valid
+                                if rgb_bgr is not None and depth_img is not None:
+                                    rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+                                    rr.log("camera/rgb", rr.Image(rgb_img))
+                                    rr.log("camera/depth", rr.DepthImage(depth_img, meter=1.0))
+                                    camera_frames_logged += 1
+                                    print(f"[DEBUG] Successfully logged frame at {current_time:.6f}")
+                                else:
+                                    print(f"[DEBUG] Failed to decode images: rgb={rgb_bgr is not None}, depth={depth_img is not None}")
+                            
+                            # Update last frame ID after successful logging
+                            last_camera_frame_id = frame_data.frame_count
+                                    
+                        except Exception as e:
+                            print(f"[DEBUG] Exception logging images: {e}")
+                            pass  # Continue if image logging fails
+                    else:
+                        # Still update last frame ID even if we skip logging
+                        last_camera_frame_id = frame_data.frame_count
+                        print(f"[DEBUG] Skipping frame log (counter={camera_frame_skip_counter})")
+                elif frame_data.frame_count == 0:
+                    # Log once if no frames are available
+                    if not hasattr(fusion_estimator, '_no_frames_logged'):
+                        print("[DEBUG] No camera frames available yet (frame_count=0)")
+                        fusion_estimator._no_frames_logged = True
                 
-                # Convert quaternion to Euler angles for display
-                from scipy.spatial.transform import Rotation as R
-                euler = R.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]]).as_euler('xyz', degrees=True)
+                # Report status every 5 seconds
+                if current_time - last_report_time >= 5.0:
+                    stats = fusion_estimator.get_statistics()
+                    
+                    # Convert quaternion to Euler angles for display
+                    from scipy.spatial.transform import Rotation as R
+                    euler = R.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]]).as_euler('xyz', degrees=True)
+                    
+                    print(f"\n=== Fusion State (t={current_time:.1f}s) ===")
+                    print(f"Position: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}] m")
+                    print(f"Orientation (RPY): [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}] deg")
+                    print()
+                    print("Sensor Stats:")
+                    print(f"  Gyro measurements: {stats['gyro_measurements']}")
+                    print(f"  Translation measurements: {stats['translation_measurements']}")
+                    print(f"  Fusion updates: {stats['fusion_updates']}")
+                    print(f"  Gyro rate: {stats['gyro_rate']:.1f} Hz")
+                    print(f"  Translation rate: {stats['translation_rate']:.1f} Hz")
+                    print(f"  Camera frames logged: {camera_frames_logged} ({camera_frames_logged/5.0:.1f} Hz)")
+                    print("=" * 50)
+                    
+                    # Reset statistics
+                    fusion_estimator.reset_statistics()
+                    last_report_time = current_time
+                    camera_frames_logged = 0  # Reset camera frame counter
+                    
+                    # Print profiling results
+                    print("\n=== PROFILING RESULTS ===")
+                    profiler.print_results(min_calls=10)
                 
-                print(f"\n=== Fusion State (t={current_time:.1f}s) ===")
-                print(f"Position: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}] m")
-                print(f"Orientation (RPY): [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}] deg")
-                print()
-                print("Sensor Stats:")
-                print(f"  Gyro measurements: {stats['gyro_measurements']}")
-                print(f"  Translation measurements: {stats['translation_measurements']}")
-                print(f"  Fusion updates: {stats['fusion_updates']}")
-                print(f"  Gyro rate: {stats['gyro_rate']:.1f} Hz")
-                print(f"  Translation rate: {stats['translation_rate']:.1f} Hz")
-                print("=" * 50)
+                # Frame rate tracking
+                # frame_timestamps.append(current_time)  # REMOVED: This was incorrectly tracking main loop iterations
+                # if current_time - last_fps_report >= 1.0:
+                #     fps = len(frame_timestamps) / (current_time - last_fps_report)
+                #     print(f"Current frame rate: {fps:.1f} FPS")
+                #     last_fps_report = current_time
                 
-                # Reset statistics
-                fusion_estimator.reset_statistics()
-                last_report_time = current_time
-            
-            time.sleep(0.01)  # 100 Hz fusion loop
+                time.sleep(0.01)  # 100 Hz fusion loop
             
     except KeyboardInterrupt:
         print("\nShutting down...")
